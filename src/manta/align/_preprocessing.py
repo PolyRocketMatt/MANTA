@@ -1,15 +1,80 @@
 import anndata as ad
+import concord as ccd
 import torch
 import numpy as np
+import scipy.sparse as sp
+import rapids_singlecell as rsc
 
 from concurrent.futures import ThreadPoolExecutor
+from sklearn.decomposition import NMF, PCA
 from typing import List
 
+from ..utils._tensor import _stochastic_nmf
 from ..utils.anndata_utils import (
     _register_coordinates, 
-    _register_transform
+    _register_transform,
+    _concat,
+    _split
 )
 from ..utils.tensor_utils import _check_tensor
+
+
+def _pca(
+    adata: ad.AnnData,
+    n_components: int = 25,
+    basis_key: str = "X_pca"
+) -> ad.AnnData:    
+    try:
+        from cuml.decomposition import PCA as cumlPCA
+
+        pca = cumlPCA(n_components=n_components, svd_solver="auto")
+        X_pca = pca.fit_transform(adata.X)
+
+        adata.obsm[basis_key] = X_pca
+    except ImportError:
+        pca = PCA(n_components=n_components, svd_solver="auto")
+        X_pca = pca.fit_transform(adata.X)
+
+        adata.obsm[basis_key] = X_pca
+
+
+def _nmf(
+    adata: ad.AnnData,
+    n_components: int = 25,
+    basis_key: str = "X_nmf"
+) -> ad.AnnData:
+    try:
+        X = adata.X
+        X = X.toarray() if hasattr(X, "toarray") else X
+        W, _ = _stochastic_nmf(
+            X=X,
+            n_components=n_components,
+            max_epochs=100,
+            batch_size=1024
+        )
+
+        adata.obsm[basis_key] = W
+    except Exception:
+        nmf = NMF(n_components=n_components)
+        X_nmf = nmf.fit_transform(adata.X)
+
+        adata.obsm[basis_key] = X_nmf
+
+
+def _integration(
+    adata: ad.AnnData,
+    batch_key: str = "batch",
+    basis: str = "X_pca",
+) -> ad.AnnData:
+    rsc.pp.harmony_integrate(
+        adata=adata,
+        key=batch_key,
+        basis=basis
+    )
+    rsc.pp.neighbors(adata, use_rep=f'{basis}_harmony')
+    rsc.tl.umap(adata)
+
+    return adata
 
 
 def _intersect_genes(
@@ -81,11 +146,13 @@ def _center(
     )
 
 
+
 def _preprocess_adata(
     adata: ad.AnnData,
     spatial_key: str = 'spatial',
-    key_added: str = 'spatial_manta'
-):
+    key_added: str = 'spatial_manta',
+):  
+    # Make sure we are working with Tensors
     _to_tensor(
         adata=adata,
         spatial_key=spatial_key,
@@ -94,6 +161,7 @@ def _preprocess_adata(
 
     spatial_key = key_added
 
+    # Centering
     _center(
         adata=adata,
         spatial_key=spatial_key,
@@ -104,12 +172,44 @@ def _preprocess_adata(
 def _preprocess(
     source: ad.AnnData,
     target: ad.AnnData,
-    gene_key: str = 'gene',
-    spatial_key: str = 'spatial',
-    key_added: str = 'spatial_manta'
+    batch_key: str = "batch",
+    n_components: int = 25,
+    pca_basis_key: str = "X_pca",
+    nmf_basis_key: str = "X_nmf",
+    gene_key: str = "gene",
+    spatial_key: str = "spatial",
+    key_added: str = "spatial_manta",
 ):
-    # Intersecting can't happen parallelized :(
-    _intersect_genes(
+    # Batch correction/gene intersection can't be parallelized :(
+    adatas = [source, target]
+
+    adata = _concat(
+        adatas=adatas,
+        batch_key=batch_key
+    )
+
+    adata = _pca(
+        adata=adata,
+        n_components=n_components,
+        basis_key=pca_basis_key
+    )
+
+    adata = _nmf(
+        adata=adata,
+        n_components=n_components,
+        basis_key=nmf_basis_key
+    )
+
+    adata = _integration(
+        adatas=adatas,
+        batch_key=batch_key,
+        basis=pca_basis_key
+    )
+
+    source = adatas[0]
+    target = adatas[1]
+    
+    adatas: List[ad.AnnData] = _intersect_genes(
         adatas=[source, target],
         gene_key=gene_key
     )
