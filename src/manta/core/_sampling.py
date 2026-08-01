@@ -66,7 +66,7 @@ def _sample_stratified(
     adata: ad.AnnData,
     bin_size: float |  TensorLike,
     spatial_key: str = "spatial_manta",
-    sample_key: str = "samples_importance",
+    sample_key: str = "samples_stratified",
     shuffle: bool = True
 ) -> None:
     pts = adata.obsm.get(spatial_key)
@@ -140,3 +140,104 @@ def _sample_stratified(
         "indices": original_indices,
         "pts": pts_s[selected]
     }
+
+
+@torch.no_grad()
+def _sample_approximate_fps(
+    adata: ad.AnnData,
+    n: int,
+    voxel_size: float,
+    spatial_key: str = "spatial_manta",
+    sample_key: str = "sample_afps",
+    shuffle: bool = True,
+) -> None:
+    pts = adata.obsm.get(spatial_key)
+    _check_tensor(pts)
+
+    if pts.numel() == 0:
+        raise ValueError("no elements to sample from")
+
+    N, D = pts.shape
+    device = _get_device()
+
+    # Shuffle to make representatives of each bin random
+    if shuffle:
+        perm = torch.randperm(N, device=device)
+        pts_s = pts[perm]
+    else:
+        perm = torch.arange(N, device=device)
+        pts_s = pts
+
+    # Voxel representation
+    mins = pts_s.min(dim=0).values
+    voxels = torch.floor(
+        (pts - mins) / voxel_size
+    ).long()
+
+    _, inverse = torch.unique(
+        voxels,
+        dim=0,
+        return_inverse=True
+    )
+    M = inverse.max() + 1
+    first = torch.full(
+        (M,),
+        N,
+        device=device,
+        dtype=torch.long()
+    )
+    ids = torch.arange(N, device=device)
+
+    first.scatter_reduce_(
+        0,
+        inverse,
+        ids,
+        reduce="amin"
+    )
+
+    coarse_pts = pts[first]
+
+    # (Approximate) FPS routine
+    M = coarse_pts.shape[0]
+    k = min(n, M)
+    selected = torch.empty(
+        k,
+        dtype=torch.long,
+        device=device
+    )
+
+    # Better initialization
+    center = coarse_pts.mean(dim=0)
+    current = torch.argmax(
+        ((coarse_pts - center) ** 2).sum(dim=1)
+    )
+
+    selected[0] = current
+
+    min_dist2 = (
+        (coarse_pts - coarse_pts[current]) ** 2
+    ).sum(dim=1)
+    min_dist2[current] = -1
+
+    for i in range(1, k):
+        current = torch.argmax(min_dist2)
+        selected[i] = current
+
+        dist2 = (
+            (coarse_pts - coarse_pts[current]) ** 2
+        ).sum(dim=1)
+
+        min_dist2 = torch.minimum(
+            min_dist2,
+            dist2
+        )
+        min_dist2[current] = -1
+
+    original_selected = first[selected]
+
+    adata.uns[f"{sample_key}"] = {
+        "n": n,
+        "indices": perm[original_selected],
+        "pts": pts_s[original_selected]
+    }
+    
