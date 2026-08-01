@@ -4,7 +4,7 @@ import torch
 
 from typing import List
 
-from ..utils._transform import Transform
+from ._transform import Transform
 
 
 def _register_coordinates(

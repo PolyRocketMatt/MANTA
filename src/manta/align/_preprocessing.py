@@ -9,14 +9,14 @@ from concurrent.futures import ThreadPoolExecutor
 from sklearn.decomposition import NMF, PCA
 from typing import List
 
-from ..utils._tensor import _stochastic_nmf
-from ..utils.anndata_utils import (
+from ..utils._anndata_utils import (
     _register_coordinates, 
     _register_transform,
     _concat,
     _split
 )
-from ..utils.tensor_utils import _check_tensor
+from ..utils._tensor_utils import _check_tensor
+from ..utils._tensor import _stochastic_nmf
 
 
 def _pca(
