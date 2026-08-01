@@ -12,20 +12,6 @@ from ..utils.anndata_utils import (
 from ..utils.tensor_utils import _check_tensor
 
 
-def _keep_gene_intersection(
-    adata: ad.AnnData,
-    gene_key: str,
-    common_genes: set[str],
-) -> ad.AnnData:
-    gene_names = adata.var[gene_key].str.upper()
-    mask = gene_names.isin(common_genes)
-
-    adata = adata[:, mask].copy()
-    adata.var_names = gene_names[mask]
-
-    return adata
-
-
 def _intersect_genes(
     adatas: List[ad.AnnData],
     gene_key: str,
@@ -33,23 +19,27 @@ def _intersect_genes(
     if not adatas:
         return []
 
-    # Compute intersection without modifying AnnData objects
-    common_genes = set(adatas[0].var[gene_key].str.upper())
-
-    for adata in adatas[1:]:
-        common_genes.intersection_update(
-            adata.var[gene_key].str.upper()
-        )
-
-    # Filter
-    return [
-        _keep_gene_intersection(
-            adata=adata,
-            gene_key=gene_key,
-            common_genes=common_genes,
-        )
+    upper_names = [
+        adata.var[gene_key].str.upper()
         for adata in adatas
     ]
+
+    # Compute intersection without modifying AnnData objects
+    common_genes = set(upper_names[0])
+    for names in upper_names[1:]:
+        common_genes.intersection_update(names)
+
+
+    result = []
+    for adata, names in zip(adatas, upper_names):
+        mask = names.isin(common_genes)
+
+        filtered = adata[:, mask].copy()
+        filtered.var_names = names[mask]
+
+        result.append(filtered)
+
+    return result
 
 
 def _to_tensor(
