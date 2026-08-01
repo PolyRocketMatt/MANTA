@@ -2,8 +2,6 @@ import anndata as ad
 import torch
 import torch.nn.functional as F
 
-from typing import Tuple
-
 from ..utils._tensor_utils import (
     _get_device,
     _check_tensor
@@ -32,7 +30,8 @@ def _voxelize(
     adata.obsm[f"voxel_{resolution}"] = voxel_indices
 
 
-def _density(
+@torch.no_grad()
+def _density_nd_old(
     adata: ad.AnnData,
     spatial_key: str = "spatial_manta",
     resolution: int = 128,
@@ -89,14 +88,13 @@ def _density(
 
             padding = [0] * D
             padding[dim] = radius
-
             padding = tuple(padding)
 
             grid = conv(grid, kernel, padding=tuple(padding))
 
         density_grid = grid[0, 0]
     
-    # Interpolate density
+    # Lookup density
     idx = voxel_indices.clamp(0, resolution - 1)
     rho = density_grid[tuple(idx[:, i] for i in range(D))]
 
@@ -114,6 +112,142 @@ def _density(
         minus_vals = density_grid[tuple(minus[:, j] for j in range(D))]
 
         grad[:, i] = (plus_vals - minus_vals) / (2 * voxel_size[i])
+
+    adata.obsm[f"rho_{resolution}"] = rho
+    adata.obsm[f"rho_grad_{resolution}"] = grad
+
+
+@torch.no_grad()
+def density_nd(
+    adata: ad.AnnData,
+    spatial_key: str = "spatial_manta",
+    resolution: int = 128,
+    sigma: float = 1.0,
+    normalize: bool = False,
+):
+    pts = adata.obsm.get(spatial_key)
+    device = _get_device()
+    dtype = torch.float32
+    _check_tensor(pts)
+
+    N, D = pts.shape
+    voxel_size, voxel_indices = _voxelize(pts, resolution)
+
+    shape = (resolution,) * D
+    density = torch.zeros(shape, device=pts.device, dtype=pts.dtype)
+
+    # Histogram
+    strides = torch.tensor(
+        [resolution ** (D - i - 1) for i in range(D)],
+        device=pts.device,
+    )
+
+    flat = (voxel_indices * strides).sum(1)
+    density.view(-1).index_add_(
+        0,
+        flat,
+        torch.ones(N, device=pts.device, dtype=pts.dtype),
+    )
+
+    if normalize:
+        density /= N
+
+    # Gaussian kernels
+    radius = max(1, int(3 * sigma))
+
+    x = torch.arange(
+        -radius,
+        radius + 1,
+        device=pts.device,
+        dtype=pts.dtype,
+    )
+
+    g = torch.exp(-(x**2) / (2 * sigma**2))
+    g /= g.sum()
+    dg = -(x / sigma**2) * g
+    conv = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[D]
+    density = density[None, None]
+
+    # Smooth density
+    for axis in range(D):
+        kernel = g.view(
+            *([1, 1] + [1] * axis + [-1] + [1] * (D - axis - 1))
+        )
+
+        pad = [0] * (2 * D)
+        pad[2 * (D - axis - 1)] = radius
+        pad[2 * (D - axis - 1) + 1] = radius
+
+        density = F.pad(density, pad, mode="reflect")
+        density = conv(density, kernel)
+
+    density_grid = density
+
+    # Gradient using derivative-of-Gaussian
+    grad_grids = []
+    for deriv_axis in range(D):
+        grid = density_grid
+
+        for axis in range(D):
+            kernel = (dg if axis == deriv_axis else g).view(
+                *([1, 1] + [1] * axis + [-1] + [1] * (D - axis - 1))
+            )
+
+            pad = [0] * (2 * D)
+            pad[2 * (D - axis - 1)] = radius
+            pad[2 * (D - axis - 1) + 1] = radius
+
+            grid = F.pad(grid, pad, mode="reflect")
+            grid = conv(grid, kernel)
+
+        grad_grids.append(grid)
+
+    # Interpolation
+    coords = voxel_indices.float() / (resolution - 1)
+    coords = coords * 2 - 1
+
+    if D == 2:
+        sample_grid = coords[:, [1, 0]].view(1, N, 1, 2)
+        rho = F.grid_sample(
+            density_grid,
+            sample_grid,
+            align_corners=True,
+            mode="bilinear",
+        )[0, 0, :, 0]
+        grad = torch.stack(
+            [
+                F.grid_sample(
+                    g,
+                    sample_grid,
+                    align_corners=True,
+                    mode="bilinear",
+                )[0, 0, :, 0]
+                for g in grad_grids
+            ],
+            dim=1,
+        )
+    else:
+        sample_grid = coords[:, [2, 1, 0]].view(1, N, 1, 1, 3)
+        rho = F.grid_sample(
+            density_grid,
+            sample_grid,
+            align_corners=True,
+            mode="bilinear",
+        )[0, 0, :, 0, 0]
+        grad = torch.stack(
+            [
+                F.grid_sample(
+                    g,
+                    sample_grid,
+                    align_corners=True,
+                    mode="bilinear",
+                )[0, 0, :, 0, 0]
+                for g in grad_grids
+            ],
+            dim=1,
+        )
+
+    grad /= voxel_size
 
     adata.obsm[f"rho_{resolution}"] = rho
     adata.obsm[f"rho_grad_{resolution}"] = grad
