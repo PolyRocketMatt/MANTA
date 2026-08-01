@@ -5,7 +5,7 @@
     <picture>
         <source srcset="img/manta-logo.png" media="(prefers-color-scheme: dark)">
         <!--<source srcset="img/lumiere-256.png" media="(prefers-color-scheme: light)">-->
-        <img width="128" height="125" src="img/manta-logo.png" alt="Manta Logo" />
+        <img width="192" height="192" src="img/manta-logo.png" alt="Manta Logo" />
     </picture>
 </p>
 
