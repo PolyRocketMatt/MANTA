@@ -12,6 +12,20 @@ from ..utils._tensor_utils import (
 
 
 @torch.no_grad()
+def _standardize(
+    x: TensorLike,
+    eps: float = 1e-8
+) -> torch.Tensor:
+    x = _as_tensor(
+        x=x,
+        device=_get_device
+    )
+    mean = x.mean(dim=0, keepdim=True)
+    std = x.std(dim=0, keepdim=True, unbiased=True)
+    return (x - mean) / (std + eps)
+
+
+@torch.no_grad()
 def _stochastic_nmf(
     x: TensorLike,
     n_components: int = 25,
