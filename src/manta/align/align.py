@@ -1,7 +1,7 @@
 import anndata as ad
 
 
-from ..align._preprocessing import _preprocess
+from ..core._preprocessing import _preprocess
 
 
 def preprocess(

@@ -16,14 +16,14 @@ from ..utils._anndata_utils import (
     _split
 )
 from ..utils._tensor_utils import _check_tensor
-from ..utils._tensor import _stochastic_nmf
+from ..utils._gpu import _stochastic_nmf
 
 
 def _pca(
     adata: ad.AnnData,
     n_components: int = 25,
     basis_key: str = "X_pca"
-) -> ad.AnnData:    
+) -> None:    
     try:
         from cuml.decomposition import PCA as cumlPCA
 
@@ -42,12 +42,12 @@ def _nmf(
     adata: ad.AnnData,
     n_components: int = 25,
     basis_key: str = "X_nmf"
-) -> ad.AnnData:
+) -> None:
     try:
         X = adata.X
         X = X.toarray() if hasattr(X, "toarray") else X
         W, _ = _stochastic_nmf(
-            X=X,
+            x=X,
             n_components=n_components,
             max_epochs=100,
             batch_size=1024
@@ -65,7 +65,7 @@ def _integration(
     adata: ad.AnnData,
     batch_key: str = "batch",
     basis: str = "X_pca",
-) -> ad.AnnData:
+) -> None:
     rsc.pp.harmony_integrate(
         adata=adata,
         key=batch_key,
@@ -73,8 +73,6 @@ def _integration(
     )
     rsc.pp.neighbors(adata, use_rep=f'{basis}_harmony')
     rsc.tl.umap(adata)
-
-    return adata
 
 
 def _intersect_genes(
@@ -153,6 +151,7 @@ def _preprocess_adata(
     key_added: str = 'spatial_manta',
 ):  
     # Make sure we are working with Tensors
+    # IMPORTANT - From here, we only work with tensor objects
     _to_tensor(
         adata=adata,
         spatial_key=spatial_key,
@@ -188,19 +187,19 @@ def _preprocess(
         batch_key=batch_key
     )
 
-    adata = _pca(
+    _pca(
         adata=adata,
         n_components=n_components,
         basis_key=pca_basis_key
     )
 
-    adata = _nmf(
+    _nmf(
         adata=adata,
         n_components=n_components,
         basis_key=nmf_basis_key
     )
 
-    adata = _integration(
+    _integration(
         adatas=adatas,
         batch_key=batch_key,
         basis=pca_basis_key
