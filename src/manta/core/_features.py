@@ -1,7 +1,10 @@
 import anndata as ad
 import torch
 
-from torch_cluster import knn_graph
+from torch_cluster import (
+    knn_graph,
+    radius
+)
 
 from ..utils._gpu import (
     _standardize,
@@ -13,7 +16,8 @@ from ..utils._tensor_utils import (
     _check_tensor
 )
 
-
+# TODO: Potentially move to @torch.inference_mode()
+@torch.no_grad()
 def _compute_graph(
     adata: ad.AnnData,
     sampling_key: str |  None = None,
@@ -53,6 +57,49 @@ def _compute_graph(
     } 
 
 
+@torch.no_grad()
+def _compute_base_features(
+    adata: ad.AnnData,
+    pca_basis_key: str | None = None,
+    nmf_basis_key: str | None = None,
+    feature_key: str = "base_features"
+) -> None:
+    if pca_basis_key == None:
+        raise ValueError("expected valid pca_basis_key, got None")
+    if nmf_basis_key == None:
+        raise ValueError("expected valid nmf_basis_key, got None")
+    
+    pca_X = adata.obsm.get(pca_basis_key)
+    nmf_X = adata.obsm.get(nmf_basis_key)
+
+    if pca_X == None:
+        raise ValueError(
+            f"expected pca embedding for key `{pca_basis_key}`, got None"
+        )
+    if nmf_X == None:
+        raise ValueError(
+            f"expected nmf embedding for key `{nmf_basis_key}`, got None"
+        )
+
+    pca_X = _standardize(x=pca_X)
+    nmf_X = _standardize(x=nmf_X)
+
+    feature = torch.cat(
+        [
+            pca_X,
+            nmf_X
+        ],
+        dim=1
+    )
+
+    adata.uns[feature_key] = {
+        "feature": feature,
+        "pca_basis_key": pca_basis_key,
+        "nmf_basis_key": nmf_basis_key,
+    }
+
+
+@torch.no_grad()
 def _compute_gene_features(
     adata: ad.AnnData,
     sampling_key: str |  None = None,
@@ -91,8 +138,8 @@ def _compute_gene_features(
             f"expected nmf embedding for key `{nmf_basis_key}`, got None"
         )
 
-    pca_X = _standardize(x=pca_X)
-    nmf_X = _standardize(x=nmf_X)
+    pca_X = _standardize(x=pca_X[indices])
+    nmf_X = _standardize(x=nmf_X[indices])
 
     graph = adata.uns.get(graph_key)
     if graph == None:
@@ -130,6 +177,7 @@ def _compute_gene_features(
     }
 
 
+@torch.no_grad()
 def _compute_graph_features(
     adata: ad.AnnData,
     sampling_key: str | None = None,
@@ -141,14 +189,13 @@ def _compute_graph_features(
         raise ValueError("expected valid sampling_key, got None")
 
     sampling = adata.uns.get(sampling_key)
-    if sampling is None:
+    if sampling == None:
         raise ValueError(
             f"expected sampling for key `{sampling_key}`, got None"
         )
 
     pts = sampling["pts"]
     indices = sampling["indices"]
-
     _check_tensor(pts)
     _check_tensor(indices)
 
@@ -219,5 +266,83 @@ def _compute_graph_features(
         "feature": feature,
         "sampling_key": sampling_key,
         "k": k,
+        "indices": indices,
+    }
+
+
+@torch.no_grad()
+def _compute_microenvironment_features(
+    adata: ad.AnnData,
+    spatial_key: str | None = None,
+    sampling_key: str | None = None,
+    base_features_key: str | None = None,
+    feature_key: str = "graph_features",
+    radius: int = 50,
+) -> None:
+    if spatial_key is None:
+        raise ValueError("expected valid spatial_key, got None")
+    if sampling_key is None:
+        raise ValueError("expected valid sampling_key, got None")
+    if base_features_key is None:
+        raise ValueError("expected valid base_features_key, got None")
+
+    all_pts = adata.obsm.get(spatial_key)
+    if all_pts == None:
+        raise ValueError(
+            f"expected tensor for key `{spatial_key}`, got None"
+        )
+
+    sampling = adata.uns.get(sampling_key)
+    if sampling == None:
+        raise ValueError(
+            f"expected sampling for key `{sampling_key}`, got None"
+        )
+
+    pts = sampling["pts"]
+    indices = sampling["indices"]
+    _check_tensor(pts)
+    _check_tensor(indices)
+
+    base_features = adata.uns.get(base_features_key)
+    if base_features is None:
+        raise ValueError(
+            f"expected gene features for key `{base_features}`, got None"
+        )
+
+    feature = base_features['feature']
+    _check_tensor(feature)
+
+    device = _get_device()
+
+    # MAKE SURE DIMENSIONALITY IS CORRECT
+    if all_pts.shape[-1] != pts.shape[-1]:
+        raise ValueError(
+            f"dimensionality of all points ({all_pts.shape[-1]}) must match dimensionality of sampled points ({pts.shape[-1]})"
+        )
+
+    row, col = radius(
+        x=all_pts,      # ALL points
+        y=pts,          # subsampled points
+        r=radius
+    )
+
+    N_s, _ = pts.shape          # N_s = # subsampled points
+    _, D_b = feature.shape      # D_b = # pca + # nmf components
+
+    micro_feature = torch.zeros((N_s, D_b), device, dtype=torch.float32)
+
+    # Sum neighbour features
+    micro_feature.index_add_(0, row, feature[col])
+
+    # Divide by # neighbours
+    counts = torch.bincount(row, minlength=N_s).clamp(min=1)
+    micro_feature /= counts.unsqueeze(1)
+
+    adata.uns[feature_key] = {
+        "feature": feature,
+        "spatial_key": spatial_key, 
+        "sampling_key": sampling_key,
+        "base_features_key": base_features_key,
+        "radius": radius,
         "indices": indices,
     }
