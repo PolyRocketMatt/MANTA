@@ -1,0 +1,15 @@
+[project]
+name = "MANTA"
+version = "2.0.0"
+description = "Multiscale Alignment for N-dimensional Transcriptome Analysis"
+readme = "README.md"
+requires-python = ">=3.13"
+
+authors = [
+  { name = "Matthias Kovacic", email = "matthias.kovacic@gmail.com" }
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.14",
+]
