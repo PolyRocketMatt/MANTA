@@ -43,6 +43,10 @@ def _density_nd_old(
     _check_tensor(pts)
 
     N, D = pts.shape
+    if D != 2 or D != 3:
+        raise ValueError("sampling supported for 2-/3-dimensional points only")
+
+    # Voxelize
     voxel_size, voxel_indices = _voxelize(pts, resolution)
 
     # Density grid
@@ -126,11 +130,13 @@ def density_nd(
     normalize: bool = False,
 ):
     pts = adata.obsm.get(spatial_key)
-    device = _get_device()
-    dtype = torch.float32
     _check_tensor(pts)
 
     N, D = pts.shape
+    if D != 2 or D != 3:
+            raise ValueError("density supported for 2-/3-dimensional points only")
+    
+    # Voxelize
     voxel_size, voxel_indices = _voxelize(pts, resolution)
 
     shape = (resolution,) * D
