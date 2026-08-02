@@ -17,4 +17,3 @@ class _GraphBatch:
     P: torch.Tensor     # [B, B] transition matrix
     idx: torch.Tensor   # [B] - original graph indices for each node
 
-

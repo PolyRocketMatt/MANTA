@@ -215,6 +215,13 @@ def _preprocess(
         batch_key=batch_key
     )
 
+    _integration(
+        adata=adata,
+        batch_key=batch_key,
+        basis=pca_basis_key,
+        progress=progress
+    )
+
     _pca(
         adata=adata,
         n_components=n_components,
@@ -226,13 +233,6 @@ def _preprocess(
         adata=adata,
         n_components=n_components,
         basis_key=nmf_basis_key,
-        progress=progress
-    )
-
-    _integration(
-        adata=adata,
-        batch_key=batch_key,
-        basis=pca_basis_key,
         progress=progress
     )
 
