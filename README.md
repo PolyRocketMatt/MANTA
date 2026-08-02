@@ -9,7 +9,7 @@
     </picture>
 </p>
 
-**MANTA** (**M**ulti-scale **A**lignment for **N**-dimensional **T**ranscriptome **A**nalysis) is a next-generation Python framework for the alignment, reconstruction and downstream analysis of transcriptome data across all spatial and temporal dimensions.
+**MANTA** (**M**odular **A**nalysis from **N**-dimensional **T**ranscriptome **A**lignment) is a next-generation Python framework for the alignment, reconstruction and downstream analysis of transcriptome data across all spatial and temporal dimensions.
 
 <h2>Getting Started</h2>
 
@@ -18,5 +18,3 @@
 In order to use MANTA, make sure you have a valid CUDA installation (12 or higher, verify using `nvcc --version`) and Conda available on your system.
 
 1. Create a Conda environment using `conda create --name myenv --file manta.yml`
-
-<h2>Usage</h2>

@@ -1,7 +1,7 @@
 [project]
 name = "MANTA"
 version = "2.0.0"
-description = "Multiscale Alignment for N-dimensional Transcriptome Analysis"
+description = "Modular Analysis from N-dimensional Transcriptome Alignment"
 readme = "README.md"
 requires-python = ">=3.13"
 

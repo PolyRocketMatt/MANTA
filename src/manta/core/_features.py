@@ -12,11 +12,10 @@ from ..utils._gpu import (
 )
 from ..utils._tensor_utils import (
     _get_device,
-    _as_tensor,
     _check_tensor
 )
 
-# TODO: Potentially move to @torch.inference_mode()
+# TODO: Consider moving to @torch.inference_mode()
 @torch.no_grad()
 def _compute_graph(
     adata: ad.AnnData,
@@ -276,7 +275,7 @@ def _compute_microenvironment_features(
     spatial_key: str | None = None,
     sampling_key: str | None = None,
     base_features_key: str | None = None,
-    feature_key: str = "graph_features",
+    feature_key: str = "micro_features",
     radius: int = 50,
 ) -> None:
     if spatial_key is None:
@@ -345,4 +344,98 @@ def _compute_microenvironment_features(
         "base_features_key": base_features_key,
         "radius": radius,
         "indices": indices,
+    }
+
+
+def _compute_features(
+    adata: ad.AnnData,
+
+    spatial_key: str | None = None,
+    sampling_key: str |  None = None,
+
+    graph_key: str = "graph",
+    base_features_key: str = "base_features",
+    gene_features_key: str = "gene_features",
+    graph_features_key: str = "graph_features",
+    micro_features_key: str = "micro_features",
+    feature_key: str = "section_features",
+
+    pca_basis_key: str | None = None,
+    nmf_basis_key: str | None = None,
+    graph_k: int = 6,
+    graph_alpha: float = 2.0,
+    graph_features_k: int = 10,
+    micro_env_radius: float = 50.0
+) -> None:
+    if sampling_key is None:
+        raise ValueError("expected valid sampling_key, got None")
+
+    sampling = adata.uns.get(sampling_key)
+    if sampling == None:
+        raise ValueError(
+            f"expected sampling for key `{sampling_key}`, got None"
+        )
+
+    indices = sampling["indices"]
+    _check_tensor(indices)
+    
+    _compute_graph(
+        adata=adata,
+        sampling_key=sampling_key,
+        graph_key=graph_key,
+        k=graph_k,
+        alpha=graph_alpha
+    )
+
+    # TODO: Consider moving into micro-environment routine
+    #       The result of this function isn't needed downstream
+    _compute_base_features(
+        adata=adata,
+        pca_basis_key=pca_basis_key,
+        nmf_basis_key=nmf_basis_key,
+        feature_key=base_features_key
+    )
+
+    _compute_gene_features(
+        adata=adata,
+        sampling_key=sampling_key,
+        graph_key=graph_key,
+        pca_basis_key=pca_basis_key,
+        nmf_basis_key=nmf_basis_key,
+        feature_key=gene_features_key
+    )
+
+    _compute_graph_features(
+        adata=adata,
+        sampling_key=sampling_key,
+        feature_key=graph_features_key,
+        k=graph_features_k
+    )
+
+    _compute_microenvironment_features(
+        adata=adata,
+        spatial_key=spatial_key,
+        sampling_key=sampling_key,
+        base_features_key=base_features_key,
+        feature_key=micro_features_key,
+        radius=micro_env_radius
+    )
+
+    gene_features       = adata.uns.get(gene_features_key)
+    graph_features      = adata.uns.get(graph_features_key)
+    micro_features      = adata.uns.get(micro_features_key)
+
+    feature_raw = torch.cat(
+        [
+            gene_features['feature'],
+            graph_features['feature'],
+            micro_features['feature']
+        ],
+        dim=1
+    )
+    feature = _standardize(x=feature_raw)
+
+    adata.uns[feature_key] = {
+        "feature": feature,
+        "indices": indices
     }
