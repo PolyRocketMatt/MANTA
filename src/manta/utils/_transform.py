@@ -7,10 +7,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Transform:
+    ndim: int
     rotation: torch.Tensor | None = None
     translation: torch.Tensor | None = None
     scale: torch.Tensor | None = None
-    ndim: int
 
     def __post_init__(self):
         if self.rotation is None:
