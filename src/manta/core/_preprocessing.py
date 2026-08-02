@@ -21,7 +21,11 @@ from ..utils._progress import (
     _get_progress,
     _update_progress
 )
-from ..utils._tensor_utils import _check_tensor
+from ..utils._tensor_utils import (
+    _as_tensor,
+    _from_tensor,
+    _check_tensor
+)
 
 
 def _pca(
@@ -70,8 +74,8 @@ def _nmf(
             batch_size=1024
         )
 
-        adata.obsm[basis_key] = W
-    except Exception:
+        adata.obsm[basis_key] = _from_tensor(W)
+    except Exception as e:
         nmf = NMF(n_components=n_components)
         X_nmf = nmf.fit_transform(adata.X)
 
@@ -134,19 +138,6 @@ def _intersect_genes(
     return result
 
 
-def _to_tensor(
-    adata: ad.AnnData,
-    spatial_key: str = 'spatial',
-    key_added: str = 'spatial'
-) -> ad.AnnData:
-    pts = adata.obsm[spatial_key]
-
-    if isinstance(pts, np.ndarray):
-        tensor_pts = torch.from_numpy(pts)
-
-    adata.obsm[key_added] = tensor_pts
-
-
 def _center(
     adata: ad.AnnData,
     spatial_key: str = 'spatial',
@@ -158,12 +149,11 @@ def _center(
         message="Centering"
     )
 
-    pts = adata.obsm[spatial_key]
-
+    pts = _as_tensor(adata.obsm[spatial_key])
     _check_tensor(pts)
 
     ndim = pts.shape[-1]
-    center = (pts.min(dim=0) + pts.max(dim=0)) / 2
+    center = (pts.min(dim=0).values + pts.max(dim=0).values) / 2
     pts_centered = pts - center
 
     _register_coordinates(
@@ -187,23 +177,17 @@ def _preprocess_adata(
     centering: bool = True,
     progress: ProgressFn = None
 ):  
-    # Make sure we are working with Tensors
-    # IMPORTANT - From here, we only work with tensor objects
-    _to_tensor(
-        adata=adata,
-        spatial_key=spatial_key,
-        key_added=key_added
-    )
-
+    adata.obsm[key_added] = adata.obsm[spatial_key]
     spatial_key = key_added
 
     # Centering
-    _center(
-        adata=adata,
-        spatial_key=spatial_key,
-        key_added=key_added,
-        progress=progress
-    )
+    if centering:
+        _center(
+            adata=adata,
+            spatial_key=spatial_key,
+            key_added=key_added,
+            progress=progress
+        )
 
 
 def _preprocess(

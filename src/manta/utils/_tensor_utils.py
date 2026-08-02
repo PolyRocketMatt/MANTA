@@ -23,6 +23,12 @@ def _as_tensor(
     return torch.as_tensor(x, device=device, dtype=dtype)
 
 
+def _from_tensor(
+    x: torch.Tensor
+) -> np.ndarray:
+    return x.detach().cpu().numpy()
+
+
 def _check_tensor(obj):
     if obj == None:
         raise ValueError(
@@ -32,3 +38,9 @@ def _check_tensor(obj):
         raise ValueError(
             f"expected `torch.Tensor`, got `{type(obj)}`"
         )
+
+
+def _off_diag(x: torch.Tensor) -> torch.Tensor:
+    N, M = x.shape
+    if N != M:
+        raise ValueError("expected square matrix")

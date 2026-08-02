@@ -4,6 +4,9 @@ import torch
 
 from typing import List
 
+from ._tensor_utils import (
+    _from_tensor
+)
 from ._transform import Transform
 
 
@@ -12,7 +15,7 @@ def _register_coordinates(
     pts: torch.Tensor,
     spatial_key: str = 'spatial',
 ) -> None:
-    adata.obsm[spatial_key] = pts
+    adata.obsm[spatial_key] = _from_tensor(pts)
 
 
 def _register_transform(

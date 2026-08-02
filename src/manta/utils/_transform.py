@@ -5,7 +5,7 @@ import torch
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
+@dataclass
 class Transform:
     ndim: int
     rotation: torch.Tensor | None = None
