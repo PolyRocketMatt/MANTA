@@ -15,15 +15,26 @@ from ..utils._anndata_utils import (
     _concat,
     _split
 )
-from ..utils._tensor_utils import _check_tensor
 from ..utils._gpu import _stochastic_nmf
+from ..utils._progress import (
+    ProgressFn,
+    _get_progress,
+    _update_progress
+)
+from ..utils._tensor_utils import _check_tensor
 
 
 def _pca(
     adata: ad.AnnData,
     n_components: int = 25,
-    basis_key: str = "X_pca"
+    basis_key: str = "X_pca",
+    progress: ProgressFn = None
 ) -> None:    
+    _update_progress(
+        progress=progress, 
+        message="Running PCA"
+    )
+
     try:
         from cuml.decomposition import PCA as cumlPCA
 
@@ -41,8 +52,14 @@ def _pca(
 def _nmf(
     adata: ad.AnnData,
     n_components: int = 25,
-    basis_key: str = "X_nmf"
+    basis_key: str = "X_nmf",
+    progress: ProgressFn = None
 ) -> None:
+    _update_progress(
+        progress=progress, 
+        message="Running NMF"
+    )
+    
     try:
         X = adata.X
         X = X.toarray() if hasattr(X, "toarray") else X
@@ -65,7 +82,13 @@ def _integration(
     adata: ad.AnnData,
     batch_key: str = "batch",
     basis: str = "X_pca",
+    progress: ProgressFn = None
 ) -> None:
+    _update_progress(
+        progress=progress, 
+        message="Running Batch Correction"
+    )
+    
     rsc.pp.harmony_integrate(
         adata=adata,
         key=batch_key,
@@ -78,9 +101,15 @@ def _integration(
 def _intersect_genes(
     adatas: List[ad.AnnData],
     gene_key: str,
+    progress: ProgressFn = None
 ) -> List[ad.AnnData]:
     if not adatas:
         return []
+
+    _update_progress(
+        progress=progress, 
+        message="Intersecting genes"
+    )
 
     upper_names = [
         adata.var[gene_key].str.upper()
@@ -121,8 +150,14 @@ def _to_tensor(
 def _center(
     adata: ad.AnnData,
     spatial_key: str = 'spatial',
-    key_added: str = 'spatial'
+    key_added: str = 'spatial',
+    progress: ProgressFn = None
 ) -> ad.AnnData:
+    _update_progress(
+        progress=progress, 
+        message="Centering"
+    )
+
     pts = adata.obsm[spatial_key]
 
     _check_tensor(pts)
@@ -149,6 +184,8 @@ def _preprocess_adata(
     adata: ad.AnnData,
     spatial_key: str = 'spatial',
     key_added: str = 'spatial_manta',
+    centering: bool = True,
+    progress: ProgressFn = None
 ):  
     # Make sure we are working with Tensors
     # IMPORTANT - From here, we only work with tensor objects
@@ -164,7 +201,8 @@ def _preprocess_adata(
     _center(
         adata=adata,
         spatial_key=spatial_key,
-        key_added=key_added
+        key_added=key_added,
+        progress=progress
     )
 
 
@@ -178,7 +216,13 @@ def _preprocess(
     gene_key: str = "gene",
     spatial_key: str = "spatial",
     key_added: str = "spatial_manta",
+    centering: bool = True
 ):
+    progress = _get_progress(
+        steps=5,
+        desc="Preprocessing"
+    )
+
     # Batch correction/gene intersection can't be parallelized :(
     adatas = [source, target]
 
@@ -190,19 +234,22 @@ def _preprocess(
     _pca(
         adata=adata,
         n_components=n_components,
-        basis_key=pca_basis_key
+        basis_key=pca_basis_key,
+        progress=progress
     )
 
     _nmf(
         adata=adata,
         n_components=n_components,
-        basis_key=nmf_basis_key
+        basis_key=nmf_basis_key,
+        progress=progress
     )
 
     _integration(
-        adatas=adatas,
+        adata=adata,
         batch_key=batch_key,
-        basis=pca_basis_key
+        basis=pca_basis_key,
+        progress=progress
     )
 
     source = adatas[0]
@@ -210,7 +257,8 @@ def _preprocess(
     
     adatas: List[ad.AnnData] = _intersect_genes(
         adatas=[source, target],
-        gene_key=gene_key
+        gene_key=gene_key,
+        progress=progress
     )
 
     # Centering can happen parallelized :)
@@ -220,13 +268,17 @@ def _preprocess(
                 _preprocess_adata,
                 adata=source,
                 spatial_key=spatial_key,
-                key_added=key_added
+                key_added=key_added,
+                centering=centering,
+                progress=progress
             ),
             executor.submit(
                 _preprocess_adata,
                 adata=target,
                 spatial_key=spatial_key,
-                key_added=key_added
+                key_added=key_added,
+                centering=centering,
+                progress=progress
             )
         ]
 
