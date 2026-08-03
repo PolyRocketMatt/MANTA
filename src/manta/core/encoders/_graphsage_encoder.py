@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from typing import (
     List,
@@ -532,12 +533,189 @@ def _assign_to_latent_template(
     return hard_cluster_ids, soft_cluster_probs, hard_quantized, soft_quantized
 
 
+def _create_graph_representation(
+    adata: ad.AnnData,
+    graph_key: str | None = None,
+    feature_key: str | None  = None,
+) -> _GraphRepresentation:
+    if graph_key == None:
+        raise ValueError("expected valid graph_key, got None")
+    if feature_key == None:
+        raise ValueError("expected valid feature_key, got None")
+
+    graph = adata.uns.get(graph_key)
+    if graph == None:
+        raise ValueError(
+            f"expected graph to be of type `dict`, got `None`"
+        )
+
+    P = graph['P']
+    _check_tensor(P)
+
+    feature = adata.uns.get(feature_key)
+    if feature == None:
+        raise ValueError(
+            f"expected feature to be of type `dict`, got `None`"
+        )    
+
+    s_features = feature['feature']
+    _check_tensor(s_features)
+
+    return _GraphRepresentation(s_features, P)
+
+
 def _embed(
     adatas: List[ad.AnnData],
 
     sampling_key: str | None = None,
     graph_key: str | None = None,
     feature_key: str | None = None,
-    embedding_key: str | None = None
+    embedding_key: str | None = None,
+
+    hidden_dim: int = 128,
+    decoder_hidden_dim: int = 64,
+    num_layers: int = 2,
+    activation: Literal["relu", "gelu"] = "gelu",
+    dropout: float = 0.0,
+    p_drop: float = 0.1,
+    eta: float = 0.01,
+
+    sim_coeff: float = 25.0,
+    var_coeff: float = 25.0,
+    cov_coeff: float = 1.0,
+    lambda_recon: float = 1.0,
+
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    epochs: int = 25,
+    steps_per_epoch: int = 250,
+    batch_size_per_graph: int = 256,
+    grad_clip: Optional[float] = 1.0,
+    shuffle_graph_order: bool = True,
+    seed: int = 42,
+
+    template_k: int = 30,
+    template_iter: int = 25,
+    template_temperature: float = 1.0,
+
+    eps: float = 1e-8
 ) -> None:
-    pass
+    graph_representations = [
+        _create_graph_representation(
+            adata=adata,
+            graph_key=graph_key,
+            feature_key=feature_key
+        )
+        for adata in adatas
+    ]
+    device = graph_representations[0].x.device
+
+    # Make sure all graph representations have the same dimensionality
+    expected_in_dims = graph_representations[0].x.shape[1]
+    for g_repr in graph_representations:
+        if g_repr.x.shape[1] != expected_in_dims:
+            raise ValueError(
+                f"expected input dimension to be {expected_in_dims}, got {g_repr.x.shape[1]} instead"
+            )
+
+    # Model
+    model = _MantaEncoder(
+        in_dim=expected_in_dims,
+        hidden_dim=hidden_dim,
+        decoder_hidden_dim=decoder_hidden_dim,
+        num_layers=num_layers,
+        activation=activation,
+        dropout=dropout,
+        p_drop=p_drop,
+        eta=eta
+    )
+
+    # Loss
+    loss_fn = _MantaEncoderLoss(
+        sim_coeff=sim_coeff,
+        var_coeff=var_coeff,
+        cov_coeff=cov_coeff,
+        lambda_recon=lambda_recon,
+        target_std=1.0,
+        eps=eps
+    )
+
+    # Training
+    result = _train(
+        model=model,
+        graphs=graph_representations,
+        loss_fn=loss_fn,
+        lr=lr,
+        weight_decay=weight_decay,
+        epochs=epochs,
+        batch_size_per_graph=batch_size_per_graph,
+        steps_per_epoch=steps_per_epoch,
+        grad_clip=grad_clip,
+        shuffle_graph_order=shuffle_graph_order,
+        seed=seed
+    )
+
+    model = result['model']
+    model.eval()
+
+    # Inference on all (subsampled) points
+    embeddings = []
+    indices = [0]
+    for adata in adatas:
+        # Encode with model
+        embedding = _encode(
+            adata=adata,
+            model=model,
+            sampling_key=sampling_key,
+            graph_key=graph_key,
+            feature_key=feature_key,
+            embedding_key=embedding_key
+        )
+
+        embeddings.append(embedding)
+        indices.append(embedding.shape[0])
+
+    # Stack all embeddings into one tensor to train k-means template
+    stacked_embedding = torch.cat(embeddings, dim=0)
+
+    # Train k-means clustering in latent space
+    template_centroids = _build_latent_template(
+        embedding=stacked_embedding,
+        k=template_k,
+        n_iter=template_iter
+    )
+
+    template_mappings = []
+    for embedding in embeddings:
+        mapping = _assign_to_latent_template(
+            embedding=embedding,
+            centroids=template_centroids,
+            temperature=template_temperature,
+            eps=eps
+        )
+
+        template_mappings.append(mapping)
+
+    # Precompute centroid kernel matrix
+    centroid_distances = torch.cdist(template_centroids, template_centroids) # [k, k]
+    mask = ~torch.eye(centroid_distances.shape[0], device=device, dtype=torch.bool)
+    tau = 0.5 * centroid_distances[mask].mean()
+    diff = template_centroids[:, None, :] - template_centroids[None, :, :]
+    Kmat = torch.exp(-(diff.pow(2).sum(-1)) / (2 * tau ** 2))
+
+    clustering_key = f"{embedding_key}_clustering"
+    for adata, template_mapping in zip(adatas, template_mappings):
+        graph = adata.uns.get(graph_key)    # Already checked against None
+        g_pts = graph['pts']
+        g_indices = graph['indices']
+
+        adata.uns[clustering_key] = {
+            "hard_cluster_ids": template_mapping[0],
+            "soft_cluster_probs": template_mapping[1],
+            "hard_quantized": template_mapping[2],
+            "soft_quantized": template_mapping[3],
+            "centroids": template_centroids,
+            "K": Kmat,
+            "pts": g_pts,
+            "indices": g_indices
+        }
