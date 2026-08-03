@@ -1,10 +1,36 @@
+import anndata as ad
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Literal
+from tqdm import tqdm
+from typing import (
+    List,
+    Literal, 
+    Optional, 
+    Sequence, 
+    Tuple
+)
 
-from ...utils._tensor_utils import _off_diag
+from ._graph_utils import (
+    _GraphRepresentation,
+    _sample_pooled_batch
+)
+from ...utils._gpu import (
+    _chunked_range,
+    _pairwise_dist,
+    _kmeans
+)
+from ...utils._progress import (
+    _get_progress,
+    _update_progress,
+    _update_postfix
+)
+from ...utils._tensor_utils import (
+    _get_device,
+    _check_tensor,
+    _off_diag
+)
 
 
 class _FeatureAugmentor(nn.Module):
@@ -255,4 +281,263 @@ class _MantaEncoderLoss(nn.Module):
         }
 
 
-        
+def _train(
+    model: _MantaEncoder,
+    graphs: Sequence[_GraphRepresentation],
+    loss_fn: _MantaEncoderLoss,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    epochs: int = 25,
+    batch_size_per_graph: int = 256,
+    steps_per_epoch: int = 250,
+    grad_clip: Optional[float] = 1.0,
+    shuffle_graph_order: bool = True,
+    seed: int = 42
+) -> dict:
+    device = _get_device()
+    model = model.to(device)
+
+    optimizer = torch.optim.AdamW(
+        params=model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer=optimizer,
+        T_max=epochs,
+        eta_min=0.0
+    )
+    generator = torch.Generator(device).manual_seed(seed=seed)
+    progress, set_postfix = _get_progress(
+        bar=epochs,
+        desc="Training"
+    )
+
+    history = {
+        "loss": [],
+        "inv": [],
+        "var": [],
+        "cov": [],
+        "recon": []
+    }
+
+    # Move graphs ONCE to GPU
+    prepared_graphs = [
+        _GraphRepresentation(
+            x=g.x.to(device, non_blocking=True),
+            P=g.P.coalesce().to(device, non_blocking=True)
+            if g.P.is_sparse
+            else g.P.to(device, non_blocking=True)
+        )
+        for g in graphs
+    ]
+
+    for i in range(epochs):
+        _update_progress(
+            progress=progress,
+            message=f"Training (Epoch {i + 1}/{epochs})"
+        )
+
+        model.train()
+
+        epoch_loss = 0.0
+        epoch_inv = 0.0
+        epoch_var = 0.0
+        epoch_cov = 0.0
+        epoch_recon = 0.0
+
+        for _ in range(steps_per_epoch):
+            # Graph order
+            if shuffle_graph_order:
+                graph_order = torch.randperm(len(prepared_graphs)).tolist()
+            else:
+                graph_order = list(range(len(prepared_graphs)))
+
+            # Sampling batch
+            batch = _sample_pooled_batch(
+                graphs=prepared_graphs,
+                nodes_per_graph=batch_size_per_graph,
+                graph_order=graph_order,
+                generator=generator
+            )
+
+            x = batch.x
+            P = batch.P
+
+            # Forward pass
+            optimizer.zero_grad(set_to_none=True)
+            out = model(x, P)
+            loss_dict = loss_fn(
+                z1=out['z1'],
+                z2=out['z2'],
+                x_true=x,
+                x_rec=out['x1_rec'],
+                P=P
+            )
+            loss = loss_dict['loss']
+
+            # Backward
+            loss.backward()
+
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    grad_clip
+                )
+
+            optimizer.step()
+
+            # Bookkeeping
+            epoch_loss += loss.item()
+            epoch_inv += loss_dict['inv'].item()
+            epoch_var += loss_dict['var'].item()
+            epoch_cov += loss_dict['cov'].item()
+            epoch_recon += loss_dict['recon'].item()
+
+        # Scheduler update
+        scheduler.step()
+
+        # Averaging over epochs
+        denom = float(steps_per_epoch)
+        epoch_loss /= denom
+        epoch_inv /= denom
+        epoch_var /= denom
+        epoch_cov /= denom
+        epoch_recon /= denom
+
+        # More bookkeeping
+        history["loss"].append(epoch_loss)
+        history["inv"].append(epoch_inv)
+        history["var"].append(epoch_var)
+        history["cov"].append(epoch_cov)
+        history["recon"].append(epoch_recon)  
+
+        _update_postfix(set_postfix, f"{epoch_loss:.3f}") 
+
+    return {
+        "model": model,
+        "history": history
+    }         
+
+
+@torch.no_grad()
+def _encode(
+    adata: ad.AnnData,
+    model: _MantaEncoder,
+    sampling_key: str | None = None,
+    graph_key: str | None = None,
+    feature_key: str | None = None,
+    embedding_key: str | None = None
+) -> None:
+    if model == None:
+        raise ValueError("expected model to be of type `_MantaEncoder`, got `None`")
+
+    if sampling_key == None:
+        raise ValueError("expected valid sampling_key, got None")
+    if graph_key == None:
+        raise ValueError("expected valid graph_key, got None")
+    if feature_key == None:
+        raise ValueError("expected valid feature_key, got None")
+    if embedding_key == None:
+        raise ValueError("expected valid embedding_key, got None")
+
+    sampling = adata.uns.get(sampling_key)
+    if sampling == None:
+        raise ValueError(
+            f"expected sampling to be of type `dict`, got `None`"
+        )
+
+    s_pts = sampling['pts']
+    s_indices = sampling['indices']
+    _check_tensor(s_pts)
+    _check_tensor(s_indices)
+
+    graph = adata.uns.get(graph_key)
+    if graph == None:
+        raise ValueError(
+            f"expected graph to be of type `dict`, got `None`"
+        )
+
+    P = graph['P']
+    _check_tensor(P)
+
+    feature = adata.uns.get(feature_key)
+    if feature == None:
+        raise ValueError(
+            f"expected feature to be of type `dict`, got `None`"
+        )    
+
+    s_features = feature['feature']
+    _check_tensor(s_features)
+
+    # Encode with model (using inference)
+    embedding = model.infer(s_features, P)
+
+    adata.uns[embedding_key] = {
+        "embedding": embedding,
+        "pts": s_pts,
+        "indices": s_indices
+    }
+
+    return embedding
+
+
+@torch.no_grad()
+def _build_latent_template(
+    embedding: torch.Tensor,
+    k: int,
+    n_iter: int = 25
+) -> torch.Tensor:
+    _, centroids = _kmeans(
+        x=embedding,
+        n_clusters=k,
+        n_iter=n_iter,
+        dist_fn="euclidean"
+    )
+    return centroids
+
+
+@torch.no_grad()
+def _assign_to_latent_template(
+    embedding: torch.Tensor,
+    centroids: torch.Tensor,
+    temperature: float = 1.0,
+    batch_size: int = 4096,
+    eps: float = 1e-8
+) -> Tuple[torch.Tensor,...]:
+    N, D = embedding.shape
+    k = centroids.shape[0]
+    device = embedding.device
+
+    hard_cluster_ids = torch.empty(N, device=device, dtype=torch.long)
+    soft_cluster_probs = torch.empty(N, k, device=device, dtype=torch.float32)
+
+    hard_quantized = torch.empty(N, D, device=device, dtype=torch.float32)
+    soft_quantized = torch.empty(N, D, device=device, dtype=torch.float32)
+
+    inv_temp = 1.0 / max(temperature, eps)
+
+    for s, e in _chunked_range(N, batch_size):
+        dist = _pairwise_dist(embedding[s:e], centroids, "euclidean")
+        logits = -dist * inv_temp
+        probs = torch.softmax(logits, dim=1)
+
+        hard_ids = probs.argmax(dim=1)
+
+        hard_cluster_ids[s:e] = hard_ids
+        soft_cluster_probs[s:e] = probs
+        hard_quantized[s:e] = centroids[hard_ids]
+        soft_quantized[s:e] = probs @ centroids
+
+    return hard_cluster_ids, soft_cluster_probs, hard_quantized, soft_quantized
+
+
+def _embed(
+    adatas: List[ad.AnnData],
+
+    sampling_key: str | None = None,
+    graph_key: str | None = None,
+    feature_key: str | None = None,
+    embedding_key: str | None = None
+) -> None:
+    pass

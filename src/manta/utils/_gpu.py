@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from typing import Tuple, Union
+from typing import Iterable, Literal, Optional, Tuple
 from torch_cluster import knn_graph
 
 from ..utils._tensor_utils import (
@@ -9,6 +9,51 @@ from ..utils._tensor_utils import (
     _get_device,
     _as_tensor
 )
+
+
+@torch.no_grad()
+def _l2_normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return x / (x.norm(dim=1, keepdim=True) + eps)
+
+
+@torch.no_grad()
+def _pairwise_sqeuclid_dist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a2 = (a * a).sum(dim=1, keepdim=True)
+    b2 = (b * b).sum(dim=1).unsqueeze(0)
+
+    return torch.clamp(a2 + b2 - 2.0 * (a @ b.t()), min=0.0)
+
+
+@torch.no_grad()
+def _pairwise_dist(
+    a: torch.Tensor, 
+    b: torch.Tensor,
+    dist_fn: Literal["euclidean", "cosine"] = "euclidean"
+) -> torch.Tensor:
+    if dist_fn == "euclidean":
+        return _pairwise_sqeuclid_dist(a, b)
+    elif dist_fn == "cosine":
+        return _pairwise_cosine_dist(a, b)
+    else:
+        raise ValueError(
+            f"no distance function named `{dist_fn}`"
+        )
+
+
+
+@torch.no_grad()
+def _pairwise_cosine_dist(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+     a = _l2_normalize(a, eps=eps)
+     b = _l2_normalize(b, eps=eps)
+
+     return 1.0 - a @ b.t()
+
+
+@torch.no_grad()
+def _chunked_range(n: int, chunk_size: int) -> Iterable[Tuple[int, int]]:
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        yield start, end
 
 
 @torch.no_grad()
@@ -158,3 +203,78 @@ def _build_knn_graph(
     ).coalesce()
 
     return A, D, P, torch.stack([row, col], dim=0)
+
+
+@torch.no_grad()
+def _kmeans(
+    x: torch.Tensor,
+    n_clusters: int,
+    n_iter: int = 25,
+    dist_fn: Literal["euclidean", "cosine"] = "euclidean",
+    sample_size: Optional[int] = 50_000,
+    batch_size: int = 4096,
+    tolerance: float = 1e-4,
+    seed: int = 0,
+    eps: float = 1e-8
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    LLoyd k-means clustering (only use for large N)
+    """
+    if not torch.is_floating_point(x):
+        x = x.to(torch.float32)
+
+    N, _ = x.shape
+    device = x.device
+    generator = torch.Generator().manual_seed(seed=seed)
+
+    if sample_size is not None and sample_size < N:
+        perm = torch.randperm(N, device=device, generator=generator)[:sample_size]
+        fit_x = x[perm]
+    else:
+        fit_x = x
+
+    M, _ = fit_x.shape
+    if n_clusters >= M:
+        # Degenerate > more clusters requested than samples
+        labels = torch.arange(N, device=device) % max(1, n_clusters)
+        centroids = x[:n_clusters].clone()
+        return labels, centroids
+
+    # kmeans++-like initialization
+    centroids = fit_x[torch.randperm(M, device=device, generator=generator)[:n_clusters]].clone()
+    for _ in range(n_iter):
+        # Fit to existing centroids
+        assign_chunks = []
+        for s, e in _chunked_range(M, batch_size):  
+            dist = _pairwise_dist(fit_x[s:e], centroids, dist_fn)
+            assign_chunks.append(torch.argmin(dist, dim=1))
+        assign = torch.cat(assign_chunks, dim=0)
+
+        # Recalculate centroids
+        new_centroids = torch.zeros_like(centroids)
+        counts = torch.zeros(n_clusters, device=device, dtype=fit_x.dtype)
+        new_centroids.index_add_(0, assign, fit_x)
+        counts.index_add_(0, assign, torch.ones_like(assign, dtype=fit_x.dtype))
+        counts = counts.clamp_min(1.0)
+        new_centroids = new_centroids / counts.unsqueeze(1)
+
+        # Re-seed empty clusters if any exist
+        empty = (counts <= 1.0)
+        if empty.any():
+            repl = fit_x[torch.randperm(M, device=device, generator=generator)[:int(empty.sum().item())]]
+            new_centroids[empty] = repl
+
+        shift = torch.norm(new_centroids - centroids) / (torch.norm(centroids) + eps)
+        centroids = new_centroids
+
+        # Convergence/Early
+        if shift.item() < tolerance:
+            break
+
+    # Final assignment (for all N)
+    labels = torch.empty(N, device=device, dtype=torch.long)
+    for s, e in _chunked_range(N, batch_size):
+        dist = _pairwise_dist(fit_x[s:e], centroids, dist_fn)
+        labels[s:e] = torch.argmin(dist, dim=1)
+
+    return labels, centroids

@@ -202,7 +202,7 @@ def _preprocess(
     key_added: str = "spatial_manta",
     centering: bool = True
 ):
-    progress = _get_progress(
+    progress, _ = _get_progress(
         steps=5,
         desc="Preprocessing"
     )
