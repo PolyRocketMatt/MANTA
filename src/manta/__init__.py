@@ -1,5 +1,6 @@
 from . import (
     features,
     plotting,
-    preprocessing
+    preprocessing,
+    sampling
 )

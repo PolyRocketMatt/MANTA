@@ -57,6 +57,10 @@ def spatial(
         raise ValueError(
             f"expected {len(adatas)} colors, got {len(colors)}"
         )
+    if len(adatas) != len(labels):
+        raise ValueError(
+            f"expected {len(adatas)} labels, got {len(labels)}"
+        )
     
     fig, ax = plt.subplots(figsize=figsize)
     legend_handles = []

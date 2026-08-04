@@ -57,15 +57,19 @@ def sampling(
         raise ValueError(
             f"expected {len(adatas)} colors, got {len(colors)}"
         )
+    if len(adatas) != len(labels):
+        raise ValueError(
+            f"expected {len(adatas)} labels, got {len(labels)}"
+        )
     
     fig, ax = plt.subplots(figsize=figsize)
     legend_handles = []
 
     for i, adata in enumerate(adatas):
         sampling = adata.uns.get(sampling_key)
-        pts = sampling['pts']
+        coords = sampling['pts']
 
-        if pts is None:
+        if coords is None:
             raise ValueError(
                 f"expected coordinate array for key `{sampling_key}`, got None"
             )

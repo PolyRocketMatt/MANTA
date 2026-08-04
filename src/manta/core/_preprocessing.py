@@ -12,8 +12,6 @@ from typing import List
 from ..utils._anndata_utils import (
     _register_coordinates, 
     _register_transform,
-    _concat,
-    _split
 )
 from ..utils._gpu import _stochastic_nmf
 from ..utils._progress import (
@@ -77,11 +75,16 @@ def _nmf(
         )
 
         adata.obsm[basis_key] = _from_tensor(W)
+        X_nmf = W
     except Exception as e:
         nmf = NMF(n_components=n_components)
         X_nmf = nmf.fit_transform(adata.X)
 
         adata.obsm[basis_key] = X_nmf
+
+    adata.uns[basis_key] = {
+        "values": X_nmf
+    }
 
 
 def _integration(
@@ -172,132 +175,3 @@ def _center(
         ndim=ndim,
         translation=-center
     )
-
-
-
-def _preprocess_adata(
-    adata: ad.AnnData,
-    spatial_key: str = 'spatial',
-    key_added: str = 'spatial_manta',
-    centering: bool = True,
-    progress: ProgressFn = None
-):  
-    adata.obsm[key_added] = adata.obsm[spatial_key]
-    spatial_key = key_added
-
-    # Centering
-    if centering:
-        _center(
-            adata=adata,
-            spatial_key=spatial_key,
-            key_added=key_added,
-            progress=progress
-        )
-
-
-def _preprocess(
-    source: ad.AnnData,
-    target: ad.AnnData,
-    batch_key: str = "batch",
-    n_components: int = 25,
-    pca_basis_key: str = "X_pca",
-    nmf_basis_key: str = "X_nmf",
-    gene_key: str = "gene",
-    spatial_key: str = "spatial",
-    key_added: str = "spatial_manta",
-    centering: bool = True
-):
-    progress, _ = _get_progress(
-        steps=6 if centering else 4,
-        desc="Preprocessing"
-    )
-
-    # Initial, independent PCA
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        _update_progress(
-            progress=progress, 
-            message="Initial PCA"
-        )
-
-        futures = [
-            executor.submit(
-                _pca,
-                adata=source,
-                n_components=n_components,
-                basis_key="X_pca",
-            ),
-            executor.submit(
-                _pca,
-                adata=target,
-                n_components=n_components,
-                basis_key="X_pca",
-            ),
-        ]
-
-        for future in futures:
-            future.result()
-
-    # Batch correction/gene intersection can't be parallelized :(
-    adatas = [source, target]
-
-    adata = _concat(
-        adatas=adatas,
-        batch_key=batch_key
-    )
-
-    _integration(
-        adata=adata,
-        batch_key=batch_key,
-        basis=pca_basis_key,
-        progress=progress
-    )
-
-    _pca(
-        adata=adata,
-        n_components=n_components,
-        basis_key=pca_basis_key,
-        progress=progress
-    )
-
-    _nmf(
-        adata=adata,
-        n_components=n_components,
-        basis_key=nmf_basis_key,
-        progress=progress
-    )
-
-    source = adatas[0]
-    target = adatas[1]
-    
-    adatas: List[ad.AnnData] = _intersect_genes(
-        adatas=[source, target],
-        gene_key=gene_key,
-        progress=progress
-    )
-
-    # Centering can happen parallelized :)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        _update_progress(
-            progress=progress, 
-            message="Centering"
-        )
-
-        futures = [
-            executor.submit(
-                _preprocess_adata,
-                adata=source,
-                spatial_key=spatial_key,
-                key_added=key_added,
-                centering=centering,
-            ),
-            executor.submit(
-                _preprocess_adata,
-                adata=target,
-                spatial_key=spatial_key,
-                key_added=key_added,
-                centering=centering,
-            )
-        ]
-
-        for future in futures:
-            future.result()

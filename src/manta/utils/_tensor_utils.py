@@ -32,7 +32,7 @@ def _from_tensor(
 
 
 def _check_tensor(obj):
-    if obj == None:
+    if obj is None:
         raise ValueError(
             f"expected `torch.Tensor`, got `None`"
         )

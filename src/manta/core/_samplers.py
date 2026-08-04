@@ -1,6 +1,7 @@
 import anndata as ad
 import torch
 
+from ..core._operators import _density_nd
 from ..utils._tensor_utils import (
     TensorLike,
     _get_device,
@@ -12,31 +13,40 @@ from ..utils._tensor_utils import (
 @torch.no_grad()
 def _sample_importance(
     adata: ad.AnnData,
-    n: int,
+    fraction: float,
+    bin_size: int,
     spatial_key: str = "spatial_manta",
-    distribution_key: str | None = None,
-    sample_key: str = "samples_importance",
+    sample_key: str = "sample_importance",
     gamma: float = 1.0
-) -> None:
-    if distribution_key == None:
-        raise ValueError(
-            f"expected distribution key to be `str`, got `None`"
-        )
-    
-    pts = adata.obsm.get(spatial_key)
-    rho = adata.obsm.get(distribution_key)
+) -> None:    
+    device = _get_device()
+    pts = _as_tensor(adata.obsm.get(spatial_key), device=device)
     _check_tensor(pts)
-    _check_tensor(rho)
 
+    # Compute density here  
+    _density_nd(
+        adata=adata,
+        spatial_key=spatial_key,
+        resolution=bin_size,
+        sigma=1.0,
+        normalize=True
+    )
+
+
+    rho = adata.uns.get(f'rho_{bin_size}')['rho']
+    _check_tensor(rho)
+    
     if pts.numel() == 0:
         raise ValueError("no elements to sample from")
 
-    N, __annotations__ = pts.shape
-    N_rho, _ = rho.shape
+    N, _ = pts.shape
+    N_rho = rho.shape[0]
     if N != N_rho:
         raise ValueError(
             f"all points must have associated distribution value (expected {N}, got {N_rho})"
         )
+
+    n = int(fraction * N)
     k = min(max(1, n), N)
 
     # Make sure to normalize the provided distribution
@@ -66,10 +76,11 @@ def _sample_stratified(
     adata: ad.AnnData,
     bin_size: float |  TensorLike,
     spatial_key: str = "spatial_manta",
-    sample_key: str = "samples_stratified",
-    shuffle: bool = True
+    sample_key: str = "sample_stratified",
+    shuffle: bool = True,
 ) -> None:
-    pts = adata.obsm.get(spatial_key)
+    device = _get_device()
+    pts = _as_tensor(adata.obsm.get(spatial_key), device=device)
     _check_tensor(pts)
 
     if pts.numel() == 0:
@@ -145,20 +156,20 @@ def _sample_stratified(
 @torch.no_grad()
 def _sample_approximate_fps(
     adata: ad.AnnData,
-    n: int,
-    voxel_size: float,
+    fraction: float,
+    bin_size: float,
     spatial_key: str = "spatial_manta",
     sample_key: str = "sample_afps",
     shuffle: bool = True,
 ) -> None:
-    pts = adata.obsm.get(spatial_key)
+    device = _get_device()
+    pts = _as_tensor(adata.obsm.get(spatial_key), device=device)
     _check_tensor(pts)
 
     if pts.numel() == 0:
         raise ValueError("no elements to sample from")
 
-    N, D = pts.shape
-    device = _get_device()
+    N, _ = pts.shape
 
     # Shuffle to make representatives of each bin random
     if shuffle:
@@ -171,7 +182,7 @@ def _sample_approximate_fps(
     # Voxel representation
     mins = pts_s.min(dim=0).values
     voxels = torch.floor(
-        (pts - mins) / voxel_size
+        (pts - mins) / bin_size
     ).long()
 
     _, inverse = torch.unique(
@@ -184,7 +195,7 @@ def _sample_approximate_fps(
         (M,),
         N,
         device=device,
-        dtype=torch.long()
+        dtype=torch.long
     )
     ids = torch.arange(N, device=device)
 
@@ -199,6 +210,7 @@ def _sample_approximate_fps(
 
     # (Approximate) FPS routine
     M = coarse_pts.shape[0]
+    n = int(N * fraction)
     k = min(n, M)
     selected = torch.empty(
         k,

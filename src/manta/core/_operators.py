@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 from ..utils._tensor_utils import (
     _get_device,
+    _as_tensor,
+    _from_tensor,
     _check_tensor
 )
 
@@ -14,7 +16,7 @@ def _voxelize(
     resolution: int = 128,
     eps: float = 1e-8
 ) -> None:
-    pts = adata.obsm.get(spatial_key)
+    pts = _as_tensor(adata.obsm.get(spatial_key))
     _check_tensor(pts)
     
     # Grid bounds
@@ -27,9 +29,12 @@ def _voxelize(
     voxel_indices = ((pts - bounds_min) / voxel_size).long().clamp(0, resolution-1)
 
     adata.uns[f"voxel_{resolution}"] = voxel_size
-    adata.obsm[f"voxel_{resolution}"] = voxel_indices
+    adata.obsm[f"voxel_{resolution}"] = _from_tensor(voxel_indices)
+
+    return voxel_size, voxel_indices
 
 
+'''
 @torch.no_grad()
 def _density_nd_old(
     adata: ad.AnnData,
@@ -37,17 +42,17 @@ def _density_nd_old(
     resolution: int = 128,
     sigma: float = 1.0
 ) -> None:
-    pts = adata.obsm.get(spatial_key)
+    pts = _as_tensor(adata.obsm.get(spatial_key))
     device = _get_device()
     dtype = torch.float32
     _check_tensor(pts)
 
     N, D = pts.shape
-    if D != 2 or D != 3:
+    if D != 2 and D != 3:
         raise ValueError("sampling supported for 2-/3-dimensional points only")
 
     # Voxelize
-    voxel_size, voxel_indices = _voxelize(pts, resolution)
+    voxel_size, voxel_indices = _voxelize(adata, resolution=resolution)
 
     # Density grid
     grid_shape = [resolution] * D
@@ -64,6 +69,8 @@ def _density_nd_old(
     density_grid_flat = density_grid.flatten()
     density_grid_flat.index_add_(0, flat_idx, torch.ones(N, device=device, dtype=dtype))
     density_grid = density_grid_flat.view(*grid_shape)
+
+    print("Ok?")
 
     # Smoothing (separable Gaussians)
     if sigma > 0:
@@ -117,27 +124,30 @@ def _density_nd_old(
 
         grad[:, i] = (plus_vals - minus_vals) / (2 * voxel_size[i])
 
-    adata.obsm[f"rho_{resolution}"] = rho
-    adata.obsm[f"rho_grad_{resolution}"] = grad
+    adata.obsm[f"rho_{resolution}"] = {
+        "rho": rho,
+        "dv": grad
+    }
+'''
 
 
 @torch.no_grad()
-def density_nd(
+def _density_nd(
     adata: ad.AnnData,
     spatial_key: str = "spatial_manta",
     resolution: int = 128,
     sigma: float = 1.0,
     normalize: bool = False,
 ):
-    pts = adata.obsm.get(spatial_key)
+    pts = _as_tensor(adata.obsm.get(spatial_key))
     _check_tensor(pts)
 
     N, D = pts.shape
-    if D != 2 or D != 3:
+    if D != 2 and D != 3:
             raise ValueError("density supported for 2-/3-dimensional points only")
-    
+
     # Voxelize
-    voxel_size, voxel_indices = _voxelize(pts, resolution)
+    voxel_size, voxel_indices = _voxelize(adata, resolution=resolution)
 
     shape = (resolution,) * D
     density = torch.zeros(shape, device=pts.device, dtype=pts.dtype)
@@ -255,5 +265,8 @@ def density_nd(
 
     grad /= voxel_size
 
-    adata.obsm[f"rho_{resolution}"] = rho
-    adata.obsm[f"rho_grad_{resolution}"] = grad
+    adata.uns[f"rho_{resolution}"] = {
+        "rho": rho,
+        "dv": grad,
+        "pts": pts,
+    }
