@@ -3,7 +3,6 @@ import torch
 
 from torch_cluster import (
     knn_graph,
-    radius
 )
 
 from ..utils._gpu import (
@@ -24,11 +23,11 @@ def _compute_graph(
     k: int = 6,
     alpha: float = 2.0
 ) -> None:
-    if sampling_key == None:
+    if sampling_key is None:
         raise ValueError("expected valid sampling_key, got None")
 
     sampling = adata.uns.get(sampling_key)
-    if sampling == None:
+    if sampling is None:
         raise ValueError(
             f"expected sampling for key `{sampling_key}`, got None"
         )
@@ -63,19 +62,19 @@ def _compute_base_features(
     nmf_basis_key: str | None = None,
     feature_key: str = "base_features"
 ) -> None:
-    if pca_basis_key == None:
+    if pca_basis_key is None:
         raise ValueError("expected valid pca_basis_key, got None")
-    if nmf_basis_key == None:
+    if nmf_basis_key is None:
         raise ValueError("expected valid nmf_basis_key, got None")
     
     pca_X = adata.obsm.get(pca_basis_key)
     nmf_X = adata.obsm.get(nmf_basis_key)
 
-    if pca_X == None:
+    if pca_X is None:
         raise ValueError(
             f"expected pca embedding for key `{pca_basis_key}`, got None"
         )
-    if nmf_X == None:
+    if nmf_X is None:
         raise ValueError(
             f"expected nmf embedding for key `{nmf_basis_key}`, got None"
         )
@@ -107,17 +106,17 @@ def _compute_gene_features(
     nmf_basis_key: str | None = None,
     feature_key: str = "gene_features",
 ) -> None:
-    if sampling_key == None:
+    if sampling_key is None:
         raise ValueError("expected valid sampling_key, got None")
-    if graph_key == None:
+    if graph_key is None:
         raise ValueError("expected valid graph_key, got None")
-    if pca_basis_key == None:
+    if pca_basis_key is None:
         raise ValueError("expected valid pca_basis_key, got None")
-    if nmf_basis_key == None:
+    if nmf_basis_key is None:
         raise ValueError("expected valid nmf_basis_key, got None")
 
     sampling = adata.uns.get(sampling_key)
-    if sampling == None:
+    if sampling is None:
         raise ValueError(
             f"expected sampling for key `{sampling_key}`, got None"
         )
@@ -128,11 +127,11 @@ def _compute_gene_features(
     pca_X = adata.obsm.get(pca_basis_key)
     nmf_X = adata.obsm.get(nmf_basis_key)
 
-    if pca_X == None:
+    if pca_X is None:
         raise ValueError(
             f"expected pca embedding for key `{pca_basis_key}`, got None"
         )
-    if nmf_X == None:
+    if nmf_X is None:
         raise ValueError(
             f"expected nmf embedding for key `{nmf_basis_key}`, got None"
         )
@@ -141,7 +140,7 @@ def _compute_gene_features(
     nmf_X = _standardize(x=nmf_X[indices])
 
     graph = adata.uns.get(graph_key)
-    if graph == None:
+    if graph is None:
         raise ValueError(
             f"expected graph representation for key `{graph_key}`, got None"
         )
@@ -188,7 +187,7 @@ def _compute_graph_features(
         raise ValueError("expected valid sampling_key, got None")
 
     sampling = adata.uns.get(sampling_key)
-    if sampling == None:
+    if sampling is None:
         raise ValueError(
             f"expected sampling for key `{sampling_key}`, got None"
         )
@@ -286,13 +285,13 @@ def _compute_microenvironment_features(
         raise ValueError("expected valid base_features_key, got None")
 
     all_pts = adata.obsm.get(spatial_key)
-    if all_pts == None:
+    if all_pts is None:
         raise ValueError(
             f"expected tensor for key `{spatial_key}`, got None"
         )
 
     sampling = adata.uns.get(sampling_key)
-    if sampling == None:
+    if sampling is None:
         raise ValueError(
             f"expected sampling for key `{sampling_key}`, got None"
         )
@@ -371,7 +370,7 @@ def _compute_features(
         raise ValueError("expected valid sampling_key, got None")
 
     sampling = adata.uns.get(sampling_key)
-    if sampling == None:
+    if sampling is None:
         raise ValueError(
             f"expected sampling for key `{sampling_key}`, got None"
         )

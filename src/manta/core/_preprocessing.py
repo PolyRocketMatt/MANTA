@@ -33,11 +33,12 @@ def _pca(
     n_components: int = 25,
     basis_key: str = "X_pca",
     progress: ProgressFn = None
-) -> None:    
-    _update_progress(
-        progress=progress, 
-        message="Running PCA"
-    )
+) -> None:  
+    if progress:  
+        _update_progress(
+            progress=progress, 
+            message="Running PCA"
+        )
 
     try:
         from cuml.decomposition import PCA as cumlPCA
@@ -59,10 +60,11 @@ def _nmf(
     basis_key: str = "X_nmf",
     progress: ProgressFn = None
 ) -> None:
-    _update_progress(
-        progress=progress, 
-        message="Running NMF"
-    )
+    if progress:  
+        _update_progress(
+            progress=progress, 
+            message="Running NMF"
+        )
     
     try:
         X = adata.X
@@ -88,10 +90,11 @@ def _integration(
     basis: str = "X_pca",
     progress: ProgressFn = None
 ) -> None:
-    _update_progress(
-        progress=progress, 
-        message="Running Batch Correction"
-    )
+    if progress:  
+        _update_progress(
+            progress=progress, 
+            message="Running Batch Correction"
+        )
     
     rsc.pp.harmony_integrate(
         adata=adata,
@@ -110,10 +113,11 @@ def _intersect_genes(
     if not adatas:
         return []
 
-    _update_progress(
-        progress=progress, 
-        message="Intersecting genes"
-    )
+    if progress:
+        _update_progress(
+            progress=progress, 
+            message="Intersecting genes"
+        )
 
     upper_names = [
         adata.var[gene_key].str.upper()
@@ -144,10 +148,11 @@ def _center(
     key_added: str = 'spatial',
     progress: ProgressFn = None
 ) -> ad.AnnData:
-    _update_progress(
-        progress=progress, 
-        message="Centering"
-    )
+    if progress:
+        _update_progress(
+            progress=progress, 
+            message="Centering"
+        )
 
     pts = _as_tensor(adata.obsm[spatial_key])
     _check_tensor(pts)
@@ -203,9 +208,34 @@ def _preprocess(
     centering: bool = True
 ):
     progress, _ = _get_progress(
-        steps=5,
+        steps=6 if centering else 4,
         desc="Preprocessing"
     )
+
+    # Initial, independent PCA
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        _update_progress(
+            progress=progress, 
+            message="Initial PCA"
+        )
+
+        futures = [
+            executor.submit(
+                _pca,
+                adata=source,
+                n_components=n_components,
+                basis_key="X_pca",
+            ),
+            executor.submit(
+                _pca,
+                adata=target,
+                n_components=n_components,
+                basis_key="X_pca",
+            ),
+        ]
+
+        for future in futures:
+            future.result()
 
     # Batch correction/gene intersection can't be parallelized :(
     adatas = [source, target]
@@ -247,6 +277,11 @@ def _preprocess(
 
     # Centering can happen parallelized :)
     with ThreadPoolExecutor(max_workers=2) as executor:
+        _update_progress(
+            progress=progress, 
+            message="Centering"
+        )
+
         futures = [
             executor.submit(
                 _preprocess_adata,
@@ -254,7 +289,6 @@ def _preprocess(
                 spatial_key=spatial_key,
                 key_added=key_added,
                 centering=centering,
-                progress=progress
             ),
             executor.submit(
                 _preprocess_adata,
@@ -262,7 +296,6 @@ def _preprocess(
                 spatial_key=spatial_key,
                 key_added=key_added,
                 centering=centering,
-                progress=progress
             )
         ]
 

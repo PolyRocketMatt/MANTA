@@ -24,9 +24,11 @@ def _as_tensor(
 
 
 def _from_tensor(
-    x: torch.Tensor
+    x: TensorLike
 ) -> np.ndarray:
-    return x.detach().cpu().numpy()
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return x
 
 
 def _check_tensor(obj):

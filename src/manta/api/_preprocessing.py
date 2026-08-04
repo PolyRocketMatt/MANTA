@@ -1,6 +1,5 @@
 import anndata as ad
 
-
 from ..core._preprocessing import _preprocess
 
 
@@ -26,14 +25,3 @@ def preprocess(
         spatial_key=spatial_key,
         key_added=key_added
     )
-    
-
-def align_rigid(
-    source: ad.AnnData,
-    target: ad.AnnData,
-):
-    pass
-
-
-def align_elastic():
-    pass
