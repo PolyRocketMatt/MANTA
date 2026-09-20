@@ -13,8 +13,14 @@
 
 <h2>Getting Started</h2>
 
+Tutorials on how to use MANTA can be found in `/notebooks`. 
+
 <h3>Installation</h3>
 
 In order to use MANTA, make sure you have a valid CUDA installation (12 or higher, verify using `nvcc --version`) and Conda available on your system.
 
 1. Create a Conda environment using `conda create --name myenv --file manta.yml`
+
+<h3>Copyright</h3>
+
+MANTA is free software licensed under the <a href="https://www.gnu.org/licenses/gpl-3.0.html">GNU General Public License v3.0</a>. The MANTA logo was created by Mika Haenen and is used with permission.

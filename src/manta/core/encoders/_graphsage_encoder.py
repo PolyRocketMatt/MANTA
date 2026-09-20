@@ -430,20 +430,20 @@ def _encode(
     feature_key: str | None = None,
     embedding_key: str | None = None
 ) -> None:
-    if model == None:
+    if model is None:
         raise ValueError("expected model to be of type `_MantaEncoder`, got `None`")
 
-    if sampling_key == None:
+    if sampling_key is None:
         raise ValueError("expected valid sampling_key, got None")
-    if graph_key == None:
+    if graph_key is None:
         raise ValueError("expected valid graph_key, got None")
-    if feature_key == None:
+    if feature_key is None:
         raise ValueError("expected valid feature_key, got None")
-    if embedding_key == None:
+    if embedding_key is None:
         raise ValueError("expected valid embedding_key, got None")
 
     sampling = adata.uns.get(sampling_key)
-    if sampling == None:
+    if sampling is None:
         raise ValueError(
             f"expected sampling to be of type `dict`, got `None`"
         )
@@ -454,7 +454,7 @@ def _encode(
     _check_tensor(s_indices)
 
     graph = adata.uns.get(graph_key)
-    if graph == None:
+    if graph is None:
         raise ValueError(
             f"expected graph to be of type `dict`, got `None`"
         )
@@ -463,7 +463,7 @@ def _encode(
     _check_tensor(P)
 
     feature = adata.uns.get(feature_key)
-    if feature == None:
+    if feature is None:
         raise ValueError(
             f"expected feature to be of type `dict`, got `None`"
         )    
@@ -538,13 +538,13 @@ def _create_graph_representation(
     graph_key: str | None = None,
     feature_key: str | None  = None,
 ) -> _GraphRepresentation:
-    if graph_key == None:
+    if graph_key is None:
         raise ValueError("expected valid graph_key, got None")
-    if feature_key == None:
+    if feature_key is None:
         raise ValueError("expected valid feature_key, got None")
 
     graph = adata.uns.get(graph_key)
-    if graph == None:
+    if graph is None:
         raise ValueError(
             f"expected graph to be of type `dict`, got `None`"
         )
@@ -553,7 +553,7 @@ def _create_graph_representation(
     _check_tensor(P)
 
     feature = adata.uns.get(feature_key)
-    if feature == None:
+    if feature is None:
         raise ValueError(
             f"expected feature to be of type `dict`, got `None`"
         )    

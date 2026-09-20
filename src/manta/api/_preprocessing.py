@@ -34,7 +34,7 @@ def preprocess(
     centering: bool = False,
 ) -> Tuple[ad.AnnData, ad.AnnData]:
     progress, _ = _get_progress(
-        steps=6 if centering else 5,
+        steps=7 if centering else 6,
         desc="Preprocessing"
     )
 
@@ -130,5 +130,10 @@ def preprocess(
 
             for future in futures:
                 future.result()
+
+    _update_progress(
+        progress=progress, 
+        message="Finished"
+    )
 
     return adatas
