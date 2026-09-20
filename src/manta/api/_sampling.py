@@ -54,10 +54,12 @@ def sample(
                     f"`{sampler}` is not a valid sampler"
                 )
 
+    """
     for adata in adatas:
         _sample(adata)
-
     """
+
+    
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(
@@ -69,4 +71,5 @@ def sample(
 
         for future in futures:
             future.result()
+    """
     """
