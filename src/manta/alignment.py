@@ -1,1 +1,1 @@
-from .api._alignment import rigid
+from .api._alignment import rigid, non_rigid
