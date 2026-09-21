@@ -30,6 +30,8 @@ def rigid(
     spatial_key: str = "spatial_manta",
     expression_key: str | None = None,
 ):
+    print(f"IMPORTANT: Rigid alignment currently utilizes NUMPY but will be moved to CUDA in the future.")
+
     rng = np.random.default_rng(seed)
     
     if voxel_scales is None:
