@@ -103,7 +103,6 @@ def _compute_features(
     graph_features      = adata.uns.get(graph_features_key)
     micro_features      = adata.uns.get(micro_features_key)
 
-    # These should 
     feature_raw = torch.cat(
         [
             gene_features['feature'],
@@ -112,6 +111,7 @@ def _compute_features(
         ],
         dim=1
     )
+
     feature = _standardize(x=feature_raw)
 
     adata.uns[feature_key] = {

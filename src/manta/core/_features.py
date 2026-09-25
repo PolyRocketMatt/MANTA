@@ -334,6 +334,8 @@ def _compute_microenvironment_features(
             f"dimensionality of all points ({all_pts.shape[-1]}) must match dimensionality of sampled points ({pts.shape[-1]})"
         )
 
+    # row -> indices in pts
+    # col -> indices in all_pts
     row, col = radius(
         x=all_pts,      # ALL points
         y=pts,          # subsampled points
@@ -353,7 +355,7 @@ def _compute_microenvironment_features(
     micro_feature /= counts.unsqueeze(1)
 
     adata.uns[feature_key] = {
-        "feature": feature,
+        "feature": micro_feature,
         "spatial_key": spatial_key, 
         "sampling_key": sampling_key,
         "base_features_key": base_features_key,
