@@ -16,7 +16,7 @@ def _voxelize(
     resolution: int = 128,
     eps: float = 1e-8
 ) -> None:
-    pts = _as_tensor(adata.obsm.get(spatial_key))
+    pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32)
     _check_tensor(pts)
     
     # Grid bounds
@@ -139,7 +139,7 @@ def _density_nd(
     sigma: float = 1.0,
     normalize: bool = False,
 ):
-    pts = _as_tensor(adata.obsm.get(spatial_key))
+    pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32)
     _check_tensor(pts)
 
     N, D = pts.shape

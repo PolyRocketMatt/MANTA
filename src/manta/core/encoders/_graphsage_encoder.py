@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
 from typing import (
     List,
     Literal, 
@@ -388,7 +386,8 @@ def _train(
 
             optimizer.step()
 
-            # Bookkeeping
+            # Making sure to call .item() to not f*ck up GPU memory by saving computation graphs :)
+            # This was a fun one...
             epoch_loss += loss.item()
             epoch_inv += loss_dict['inv'].item()
             epoch_var += loss_dict['var'].item()

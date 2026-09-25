@@ -40,9 +40,9 @@ def _aggregate(
     # Handle sparse matrix
     if hasattr(X, "toarray"):
         X = X.toarray()
-    X = _as_tensor(X, device=device, dtype=torch.float32)
+    X = _as_tensor(X, dtype=torch.float32, device=device)
 
-    pts = _as_tensor(adata.obsm.get(spatial_key), device=device, dtype=torch.float32)
+    pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32, device=device)
     voxel_idx, origin = _voxelize(pts, bin_size)
 
     keys, inverse, counts = torch.unique(

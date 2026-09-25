@@ -1,0 +1,1 @@
+from .api._embed import embed

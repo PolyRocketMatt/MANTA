@@ -91,6 +91,7 @@ def _integration(
     adata: ad.AnnData,
     batch_key: str = "batch",
     basis: str = "X_pca",
+    max_iter_harmony: int = 10,
     progress: ProgressFn = None
 ) -> None:
     if progress:  
@@ -102,7 +103,8 @@ def _integration(
     rsc.pp.harmony_integrate(
         adata=adata,
         key=batch_key,
-        basis=basis
+        basis=basis,
+        max_iter_harmony=max_iter_harmony
     )
     rsc.pp.neighbors(adata, use_rep=f'{basis}_harmony')
     rsc.tl.umap(adata)
@@ -157,7 +159,7 @@ def _center(
             message="Centering"
         )
 
-    pts = _as_tensor(adata.obsm[spatial_key])
+    pts = _as_tensor(adata.obsm[spatial_key], dtype=torch.float32)
     _check_tensor(pts)
 
     ndim = pts.shape[-1]

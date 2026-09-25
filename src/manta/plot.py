@@ -1,6 +1,6 @@
 from .api._plotting import (
     density,
-    multichannel,
+    rigid_history,
     sampling,
-    spatial
+    spatial,
 )

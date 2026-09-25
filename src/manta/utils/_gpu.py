@@ -63,7 +63,8 @@ def _standardize(
 ) -> torch.Tensor:
     x = _as_tensor(
         x=x,
-        device=_get_device
+        dtype=torch.float32,
+        device=x.device
     )
     mean = x.mean(dim=0, keepdim=True)
     std = x.std(dim=0, keepdim=True, unbiased=True)
@@ -78,16 +79,18 @@ def _stochastic_nmf(
     batch_size: int = 1024,
     eps: float = 1e-8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = _get_device()
     x = _as_tensor(
         x=x,
-        device=_get_device()
+        dtype=torch.float32,
+        device=device,
     )
 
     n_samples, n_features = x.shape
 
     # Initialize factors
-    W = torch.rand((n_samples, n_components), device=_get_device())
-    H = torch.rand((n_components, n_features), device=_get_device())
+    W = torch.rand((n_samples, n_components), device=device)
+    H = torch.rand((n_components, n_features), device=device)
 
     def get_batch(idx):
         Xb = x[idx]
@@ -124,8 +127,8 @@ def _build_knn_graph(
     batch: torch.Tensor = None,
     mutual: bool = True,
     loop: bool = False,
-    device: str = "cpu"
 ) -> Tuple[torch.Tensor, ...]:
+    device = x.device
     N = x.size(0)
 
     # kNN Graph (initial edges)
@@ -142,6 +145,10 @@ def _build_knn_graph(
 
     counts = torch.bincount(row_s, minlength=N)
     max_k = counts.max().item()
+
+    if max_k == 0:
+        raise RuntimeError("k = 0 during graph construction")
+
     pad = torch.full((N, max_k), float('inf'), device=device)
     idx = torch.zeros(N, device=device, dtype=torch.long)
 

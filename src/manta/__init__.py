@@ -1,8 +1,8 @@
 from . import (
     alignment,
     cuda,
-    features,
-    plotting,
+    embedding,
+    plot,
     preprocessing,
     sampling
 )

@@ -20,7 +20,7 @@ def _sample_importance(
     gamma: float = 1.0
 ) -> None:    
     device = _get_device()
-    pts = _as_tensor(adata.obsm.get(spatial_key), device=device)
+    pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32, device=device)
     _check_tensor(pts)
 
     # Compute density here  
@@ -80,7 +80,7 @@ def _sample_stratified(
     shuffle: bool = True,
 ) -> None:
     device = _get_device()
-    pts = _as_tensor(adata.obsm.get(spatial_key), device=device)
+    pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32, device=device)
     _check_tensor(pts)
 
     if pts.numel() == 0:
@@ -163,7 +163,7 @@ def _sample_approximate_fps(
     shuffle: bool = True,
 ) -> None:
     device = _get_device()
-    pts = _as_tensor(adata.obsm.get(spatial_key), device=device)
+    pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32, device=device)
     _check_tensor(pts)
 
     if pts.numel() == 0:

@@ -13,7 +13,7 @@ def _get_device():
 
 def _as_tensor(
     x: TensorLike, 
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype,
     device: str = "cpu"
 ) -> torch.Tensor:
     if torch.is_tensor(x):

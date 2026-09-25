@@ -1,4 +1,5 @@
 import anndata as ad
+import torch
 
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
@@ -31,6 +32,7 @@ def preprocess(
     gene_key: str = "gene",
     spatial_key: str = "spatial",
     key_added: str = "spatial_manta",
+    max_harmony_iterations: int = 10,
     centering: bool = False,
 ) -> Tuple[ad.AnnData, ad.AnnData]:
     progress, _ = _get_progress(
@@ -74,6 +76,7 @@ def preprocess(
         adata=adata,
         batch_key=batch_key,
         basis=pca_basis_key,
+        max_iter_harmony=max_harmony_iterations,
         progress=progress
     )
 
@@ -105,8 +108,8 @@ def preprocess(
         adata.obsm[key_added] = adata.obsm[spatial_key]
 
         # Insert multichannel types
-        adata.uns[pca_basis_key] = { "values": _as_tensor(adata.obsm[pca_basis_key]) }
-        adata.uns[nmf_basis_key] = { "values": _as_tensor(adata.obsm[nmf_basis_key]) }
+        adata.uns[pca_basis_key] = { "values": _as_tensor(adata.obsm[pca_basis_key], dtype=torch.float32) }
+        adata.uns[nmf_basis_key] = { "values": _as_tensor(adata.obsm[nmf_basis_key], dtype=torch.float32) }
 
     spatial_key = key_added
 
