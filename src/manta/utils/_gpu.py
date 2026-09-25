@@ -224,6 +224,9 @@ def _kmeans(
     seed: int = 0,
     eps: float = 1e-8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Okay... TODO: Do we really insert a cpu-bound tensor here?
+    x = _as_tensor(x, x.dtype, _get_device())
+    
     """
     LLoyd k-means clustering (only use for large N)
     """
@@ -232,7 +235,7 @@ def _kmeans(
 
     N, _ = x.shape
     device = x.device
-    generator = torch.Generator().manual_seed(seed=seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
 
     if sample_size is not None and sample_size < N:
         perm = torch.randperm(N, device=device, generator=generator)[:sample_size]

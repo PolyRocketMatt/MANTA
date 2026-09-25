@@ -27,7 +27,7 @@ from ...utils._progress import (
 )
 from ...utils._tensor_utils import (
     _get_device,
-    _check_tensor,
+    _as_tensor,
     _off_diag
 )
 
@@ -288,7 +288,7 @@ def _train(
     weight_decay: float = 1e-4,
     epochs: int = 25,
     batch_size_per_graph: int = 256,
-    steps_per_epoch: int = 250,
+    steps_per_epoch: int = 15,
     grad_clip: Optional[float] = 1.0,
     shuffle_graph_order: bool = True,
     seed: int = 42
@@ -306,9 +306,9 @@ def _train(
         T_max=epochs,
         eta_min=0.0
     )
-    generator = torch.Generator(device).manual_seed(seed=seed)
+    generator = torch.Generator(device).manual_seed(seed)
     progress, set_postfix = _get_progress(
-        bar=epochs,
+        steps=epochs,
         desc="Training"
     )
 
@@ -370,8 +370,7 @@ def _train(
                 z1=out['z1'],
                 z2=out['z2'],
                 x_true=x,
-                x_rec=out['x1_rec'],
-                P=P
+                x_rec=out['x1_rec']
             )
             loss = loss_dict['loss']
 
@@ -412,7 +411,7 @@ def _train(
         history["cov"].append(epoch_cov)
         history["recon"].append(epoch_recon)  
 
-        _update_postfix(set_postfix, f"{epoch_loss:.3f}") 
+        _update_postfix(set_postfix, loss=f"{epoch_loss:.3f}") 
 
     return {
         "model": model,
@@ -447,10 +446,9 @@ def _encode(
             f"expected sampling to be of type `dict`, got `None`"
         )
 
-    s_pts = sampling['pts']
-    s_indices = sampling['indices']
-    _check_tensor(s_pts)
-    _check_tensor(s_indices)
+    device = _get_device()
+    s_pts = _as_tensor(sampling["pts"], dtype=torch.float32, device=device)
+    s_indices = _as_tensor(sampling["indices"], dtype=torch.int64, device=device)
 
     graph = adata.uns.get(graph_key)
     if graph is None:
@@ -458,8 +456,7 @@ def _encode(
             f"expected graph to be of type `dict`, got `None`"
         )
 
-    P = graph['P']
-    _check_tensor(P)
+    P = _as_tensor(graph['P'], dtype=torch.float32, device=device)
 
     feature = adata.uns.get(feature_key)
     if feature is None:
@@ -467,8 +464,7 @@ def _encode(
             f"expected feature to be of type `dict`, got `None`"
         )    
 
-    s_features = feature['feature']
-    _check_tensor(s_features)
+    s_features = _as_tensor(feature['feature'], dtype=torch.float32, device=device)
 
     # Encode with model (using inference)
     embedding = model.infer(s_features, P)
@@ -548,8 +544,8 @@ def _create_graph_representation(
             f"expected graph to be of type `dict`, got `None`"
         )
 
-    P = graph['P']
-    _check_tensor(P)
+    device = _get_device()
+    P = _as_tensor(graph['P'], dtype=torch.float32, device=device)
 
     feature = adata.uns.get(feature_key)
     if feature is None:
@@ -557,8 +553,7 @@ def _create_graph_representation(
             f"expected feature to be of type `dict`, got `None`"
         )    
 
-    s_features = feature['feature']
-    _check_tensor(s_features)
+    s_features = _as_tensor(feature['feature'], dtype=torch.float32, device=device)
 
     return _GraphRepresentation(s_features, P)
 
@@ -587,7 +582,7 @@ def _embed(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     epochs: int = 25,
-    steps_per_epoch: int = 250,
+    steps_per_epoch: int = 15,
     batch_size_per_graph: int = 256,
     grad_clip: Optional[float] = 1.0,
     shuffle_graph_order: bool = True,
@@ -705,8 +700,10 @@ def _embed(
     clustering_key = f"{embedding_key}_clustering"
     for adata, template_mapping in zip(adatas, template_mappings):
         graph = adata.uns.get(graph_key)    # Already checked against None
-        g_pts = graph['pts']
         g_indices = graph['indices']
+
+        # TODO: Make this call safe, by making sure the points actually exist
+        g_pts = _as_tensor(adata.uns.get(sampling_key)["pts"], dtype=torch.float32, device=device)
 
         adata.uns[clustering_key] = {
             "hard_cluster_ids": template_mapping[0],

@@ -19,7 +19,6 @@ from ..utils._tensor_utils import (
     _get_device,
     _as_tensor,
     _from_tensor,
-    _check_tensor
 )
 
 

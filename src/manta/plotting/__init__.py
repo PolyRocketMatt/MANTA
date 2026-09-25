@@ -1,3 +1,4 @@
+from ._embedding import *
 from ._features import *
 from ._history import *
 from ._sampling import *

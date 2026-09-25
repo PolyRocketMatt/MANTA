@@ -6,7 +6,6 @@ from ..utils._tensor_utils import (
     TensorLike,
     _get_device,
     _as_tensor,
-    _check_tensor
 )
 
 
@@ -21,7 +20,6 @@ def _sample_importance(
 ) -> None:    
     device = _get_device()
     pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32, device=device)
-    _check_tensor(pts)
 
     # Compute density here  
     _density_nd(
@@ -33,8 +31,7 @@ def _sample_importance(
     )
 
 
-    rho = adata.uns.get(f'rho_{bin_size}')['rho']
-    _check_tensor(rho)
+    rho = _as_tensor(adata.uns.get(f'rho_{bin_size}')['rho'], dtype=torch.float32, device=device)
     
     if pts.numel() == 0:
         raise ValueError("no elements to sample from")
@@ -81,7 +78,6 @@ def _sample_stratified(
 ) -> None:
     device = _get_device()
     pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32, device=device)
-    _check_tensor(pts)
 
     if pts.numel() == 0:
         raise ValueError("no elements to sample from")
@@ -164,7 +160,6 @@ def _sample_approximate_fps(
 ) -> None:
     device = _get_device()
     pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32, device=device)
-    _check_tensor(pts)
 
     if pts.numel() == 0:
         raise ValueError("no elements to sample from")

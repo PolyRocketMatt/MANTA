@@ -2,13 +2,11 @@ import anndata as ad
 import torch
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from ...utils._tensor_utils import (
-    TensorLike,
     _get_device,
     _as_tensor,
-    _check_tensor
 )
 
 

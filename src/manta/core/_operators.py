@@ -6,7 +6,6 @@ from ..utils._tensor_utils import (
     _get_device,
     _as_tensor,
     _from_tensor,
-    _check_tensor
 )
 
 
@@ -17,7 +16,6 @@ def _voxelize(
     eps: float = 1e-8
 ) -> None:
     pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32)
-    _check_tensor(pts)
     
     # Grid bounds
     bounds_min = pts.min(0).values
@@ -45,7 +43,6 @@ def _density_nd_old(
     pts = _as_tensor(adata.obsm.get(spatial_key))
     device = _get_device()
     dtype = torch.float32
-    _check_tensor(pts)
 
     N, D = pts.shape
     if D != 2 and D != 3:
@@ -140,7 +137,6 @@ def _density_nd(
     normalize: bool = False,
 ):
     pts = _as_tensor(adata.obsm.get(spatial_key), dtype=torch.float32)
-    _check_tensor(pts)
 
     N, D = pts.shape
     if D != 2 and D != 3:

@@ -10,7 +10,6 @@ from ..utils._gpu import (
 from ..utils._tensor_utils import (
     _get_device,
     _as_tensor,
-    _check_tensor
 )
 
 # TODO: Consider moving to @torch.inference_mode()
@@ -60,7 +59,6 @@ def _compute_base_features(
     adata: ad.AnnData,
     pca_basis_key: str | None = None,
     nmf_basis_key: str | None = None,
-    graph_key: str = "graph",
     feature_key: str = "base_features"
 ) -> None:
     if pca_basis_key is None:
@@ -81,11 +79,8 @@ def _compute_base_features(
             f"expected nmf embedding for key `{nmf_basis_key}`, got None"
         )
 
-    #indices = _as_tensor(adata.uns[graph_key]["indices"], dtype=torch.int64, device=device)
-
-    # Take indices only AFTER standardizing to keep information regarding ALL observations
-    pca_X = _standardize(x=pca_X)   #[indices]
-    nmf_X = _standardize(x=nmf_X)   #[indices]
+    pca_X = _standardize(x=pca_X)
+    nmf_X = _standardize(x=nmf_X)
 
     feature = torch.cat(
         [

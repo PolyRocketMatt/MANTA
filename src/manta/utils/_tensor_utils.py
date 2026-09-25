@@ -31,18 +31,8 @@ def _from_tensor(
     return x
 
 
-def _check_tensor(obj):
-    if obj is None:
-        raise ValueError(
-            f"expected `torch.Tensor`, got `None`"
-        )
-    if not isinstance(obj, torch.Tensor):
-        raise ValueError(
-            f"expected `torch.Tensor`, got `{type(obj)}`"
-        )
-
-
 def _off_diag(x: torch.Tensor) -> torch.Tensor:
     N, M = x.shape
     if N != M:
         raise ValueError("expected square matrix")
+    return x.flatten()[:-1].view(N-1, N+1)[:, 1:].flatten()

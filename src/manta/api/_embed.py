@@ -200,7 +200,6 @@ def embed(
         message=f"Finished"
     )
 
-    """
     _embed(
         adatas=adatas,
 
@@ -237,4 +236,3 @@ def embed(
 
         eps=1e-8
     )
-    """

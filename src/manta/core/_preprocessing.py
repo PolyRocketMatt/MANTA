@@ -22,7 +22,6 @@ from ..utils._progress import (
 from ..utils._tensor_utils import (
     _as_tensor,
     _from_tensor,
-    _check_tensor
 )
 
 
@@ -160,7 +159,6 @@ def _center(
         )
 
     pts = _as_tensor(adata.obsm[spatial_key], dtype=torch.float32)
-    _check_tensor(pts)
 
     ndim = pts.shape[-1]
     center = (pts.min(dim=0).values + pts.max(dim=0).values) / 2

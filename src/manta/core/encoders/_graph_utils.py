@@ -139,7 +139,7 @@ def _sample_pooled_batch(
                 f"expected graph transition matrix to be on `{device}`, is on `{g.P.device}`"
             )
 
-        n = g.x.sie(0)
+        n = g.x.size(0)
         take = min(nodes_per_graph, n)
 
         perm = torch.randperm(
