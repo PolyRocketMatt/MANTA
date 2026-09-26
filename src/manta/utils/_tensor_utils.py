@@ -6,9 +6,14 @@ from typing import Union
 
 TensorLike = Union[np.ndarray, torch.Tensor]
 
+_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 def _get_device():
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
+    return _DEVICE
+
+
+def _set_device(device: str):
+    _DEVICE = device
 
 
 def _as_tensor(

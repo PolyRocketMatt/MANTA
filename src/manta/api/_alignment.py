@@ -9,6 +9,9 @@ from ..core.alignment._rigid import (
     _apply_transform,
     _ransac
 )
+from ..core.alignment._non_rigid import (
+    _match
+)
 from ..utils._progress import (
     _get_progress,
     _update_progress,
@@ -162,5 +165,39 @@ def rigid(
     )
 
 
-def non_rigid():
-    pass
+def non_rigid(
+    source: ad.AnnData,
+    target: ad.AnnData,
+
+    embedding_key: str | None = None,
+    clustering_key: str | None = None,
+
+    top_n_clusters: int = 5,
+    top_k_matches: int = 10,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
+    temperature: float = 1.0,
+
+    # OT Hyperparameters
+    epsilon: float = 0.05,
+    rho_src: float = 1.0,
+    rho_tgt: float = 1.0,
+    num_sinkhorn_iters: int = 50,
+):
+    _match(
+        source=source,
+        target=target,
+        embedding_key=embedding_key,
+        clustering_key=clustering_key,
+        top_n_clusters=top_n_clusters,
+        top_k_matches=top_k_matches,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        temperature=temperature,
+        epsilon=epsilon,
+        rho_src=rho_src,
+        rho_tgt=rho_tgt,
+        num_sinkhorn_iters=num_sinkhorn_iters
+    )

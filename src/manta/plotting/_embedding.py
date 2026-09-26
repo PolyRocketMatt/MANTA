@@ -573,7 +573,7 @@ def embedding(
         )
 
     ax_dataset.set_title(
-        "Latent space — Dataset Partitioning",
+        "Latent space — Dataset Integration",
         fontsize=title_fontsize,
     )
 
