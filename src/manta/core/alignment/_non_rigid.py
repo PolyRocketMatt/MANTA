@@ -1,10 +1,12 @@
 import anndata as ad
 import math
+import time
 import torch
 import torch.nn.functional as F
 
 from dataclasses import dataclass, field
 from scipy.interpolate import griddata
+from tqdm import tqdm
 from typing import List, Literal, Tuple
 
 from ...utils._gpu import (
@@ -498,3 +500,830 @@ def _build_diff_operators(l_x: int, l_y: int) -> dict:
         ops["l2y"] = torch.zeros(0, P, dtype=torch.float32, device=device)
 
     return ops
+
+
+def _build_gmrf_prior(
+    l_x: int,
+    l_y: int,
+    shape: Literal["bending", "membrane", "combined"] = "bending"
+) -> torch.Tensor:
+    device = _get_device()
+    P = l_x * l_y
+    ops = _build_diff_operators(l_x, l_y)
+
+    L0 =  torch.zeros(P, P, dtype=torch.float32, device=device)
+
+    if shape in ("membrane", "combined"):
+        L0 += ops["l1x"].T @ ops["l1x"] + ops["l1y"].T @ ops["l1y"]
+
+    if shape in ("bending", "combined"):
+        L0 += ops["l2x"].T @ ops["l2x"] + ops["l2y"].T @ ops["l2y"]
+
+    # Ridge to make sure L0 is positive-definite
+    L0 += 1e-5 * torch.eye(P, dtype=torch.float32, device=device)
+
+    return L0
+
+
+def _geman_mcclure_weight(
+    residual_sq: torch.Tensor,
+    kappa: float,
+    w_min: float = 0.0
+) -> torch.Tensor:
+    kappa = max(float(kappa), 1e-12)
+    w = (kappa ** 2) / (kappa + residual_sq).pow(2).clamp(min=1e-24)
+    return w.clamp(min=w_min) if w_min > 0.0 else w
+
+
+@dataclass
+class _NRRegistrationResult:
+    """
+    Container for outputs from _ProbabilisticRegistration.fit()
+    """
+
+    # Posterior field parameters
+    mu_x:           torch.Tensor    # [P]   posterior mean of x-component control points
+    mu_y:           torch.Tensor    # [P]   posterior mean of y-component control points
+    v_x:            torch.Tensor    # [P]   posterior diagonal variance of phi_x
+    v_y:            torch.Tensor    # [P]   posterior diagonal variance of phi_y
+
+    # Per-node inlier confidence
+    r:              torch.Tensor    # [N]   per-point responsibilities in [0, 1]
+
+    # Learned hyperparameters
+    pi0:            float           # final learned inlier rate
+    sigma_in:       float           # final learned inlier noise std
+    alpha:          float           # final learned regularisation scale
+
+    # Diagnostics
+    elbo_hist:      list            # ELBO per iteration
+    delta_hist:     list            # In-between deformation at each CAVI iteration
+    diff_hist:      list            # Error of source to target at each CAVI iteration
+    inlier_hist:    list            # Percentage of being an inlier at each CAVI iteration
+    elapsed:        float           # Wall-clock (in seconds) for the full fit
+
+    # Grid metadata
+    l_x:            int
+    l_y:            int
+    origin:         torch.Tensor    # [2]
+    h:              float
+
+    # Discontinuity-aware diagnostics (None unless discontinuity_aware=True)
+    tear_weight_x:  torch.Tensor | None = None  # [rows(l1x)]   final tear gate, x-membrane edges
+    tear_weight_y:  torch.Tensor | None = None  # [rows(l1y)]   final tear gate, y-membrane edges
+    fold_weight_x:  torch.Tensor | None = None  # [rows(l2x)]   final fold gate, x-bending edges
+    fold_weight_z:  torch.Tensor | None = None  # [rows(l2y)]   final fold gate, y-bending edges
+    tear_gate_hist: list = field(default_factory=list)  # mean tear weight per iteration
+    fold_gate_hist: list = field(default_factory=list)  # mean fold weight per iteration
+
+
+class _ProbabilisticRegistration:
+    def __init__(
+        self,
+        l_x: int = 32,
+        l_y: int = 32,
+        regularisation_shape: Literal["bending", "membrane", "combined"] = "bending",
+
+        pi0_init: float = 0.8,
+        sigma_in_init: float | None = None,
+        alpha_init: float = 1.0,
+        alpha_max: float = 1e6,
+        
+        barrier_alpha: float = 1e-3,
+        barrier_lr: float = 0.5,
+        barrier_steps: int = 3,
+
+        tolerance: float = 1e-4,
+        patience: int = 5,
+        min_iters: int = 5,
+        n_iters: int = 20,
+
+        discontinuity_aware: bool = False,
+        allow_tears: bool = True,
+        allow_folds: bool = True,
+        kappa_tear: float | None = None,
+        kappa_fold: float | None = None,
+        fold_barrier_suppression: bool = True
+    ):
+        self.l_x                    = l_x
+        self.l_y                    = l_y
+        self.reg_shape              = regularisation_shape
+
+        self.pi0_init               = pi0_init
+        self.sigma_in_init          = sigma_in_init
+        self.alpha_init             = alpha_init
+        self.alpha_max              = alpha_max
+
+        self.barrier_alpha          = barrier_alpha
+        self.barrier_lr             = barrier_lr
+        self.barrier_steps          = barrier_steps
+
+        self.tolerance              = tolerance
+        self.patience               = patience
+        self.min_iters              = min_iters
+        self.n_iters                = n_iters
+
+        self.discontinuity_aware    = discontinuity_aware
+        self.allow_tears            = bool(discontinuity_aware and allow_tears)
+        self.allow_folds            = bool(discontinuity_aware and allow_folds)
+        self.kappa_tear             = kappa_tear
+        self.kappa_fold             = kappa_fold
+        self.barrier_suppression    = fold_barrier_suppression
+
+
+    def _apply_internal_deformation(
+        self,
+        x: torch.Tensor,
+        origin: torch.Tensor,
+        h: float,
+        l_x: int,
+        l_y: int,
+        mu_x: torch.Tensor,
+        mu_y: torch.Tensor
+    ) -> torch.Tensor:
+        B = _build_design_matrix(
+            x=x,
+            origin=origin,
+            h=h,
+            l_x=l_x,
+            l_y=l_y
+        )
+
+        return x + torch.stack([B @ mu_x, B @ mu_y], dim=1)
+
+
+    def apply_deformation(
+        self,
+        x: torch.Tensor,
+        result: _NRRegistrationResult
+    ) -> torch.Tensor:
+        return self._apply_internal_deformation(
+            x=x,
+            origin=result.origin,
+            h=result.h,
+            l_x=result.l_x,
+            l_y=result.l_y,
+            mu_x=result.mu_x,
+            mu_y=result.mu_y
+        )
+
+
+    def posterior_displacement_std(
+        self,
+        x: torch.Tensor,
+        result: _NRRegistrationResult
+    ) -> torch.Tensor:
+        B = _build_design_matrix(
+            x=x,
+            origin=result.origin,
+            h=result.h,
+            l_x=result.l_x,
+            l_y=result.l_y
+        )
+
+        B2 = B.pow(2)
+        std_x = (B2 @ result.v_x).sqrt()
+        std_y = (B2 @ result.v_y).sqrt()
+
+        return torch.stack([std_x, std_y], dim=1)
+
+
+    def fit(
+        self,
+        src_x:          torch.Tensor,
+        tgt_x:          torch.Tensor,
+        tgt_scores:     torch.Tensor,
+        use_softmax:    bool = True
+    ) -> _NRRegistrationResult:
+        device = _get_device()
+        t0 = time.perf_counter()
+
+        src_x       = src_x.to(torch.float32)
+        tgt_x       = tgt_x.to(torch.float32) 
+        tgt_scores  = tgt_scores.to(torch.float32)
+
+        # Compute displaacement targets
+        delta = self._compute_displacement_targets(
+            src_x=src_x,
+            tgt_x=tgt_x,
+            tgt_scores=tgt_scores,
+            use_softmax=use_softmax
+        )
+
+        delta_x, delta_y = delta[:, 0], delta[:, 1]
+        N = delta.shape[0]
+
+        # Uniform outlier constants (precomputed once, here)
+        omega_x = float((delta_x.max() - delta_x.min()).clamp(min=1e-6).item())
+        omega_y = float((delta_y.max() - delta_y.min()).clamp(min=1e-6).item())
+        log_ell_out = -(math.log(omega_x) + math.log(omega_y))
+
+        # B-spline grid
+        origin, h = self._compute_grid(src_x)
+        B = _build_design_matrix(
+            x=src_x,
+            origin=origin,
+            h=h,
+            l_x=self.l_x,
+            l_y=self.l_y
+        )
+        B2 = B.pow(2)
+
+        # Regularisation structure
+        P = self.l_x * self.l_y
+        ops = None,
+        kappa_tear = kappa_fold = None
+        if self.discontinuity_aware:
+            ops = _build_diff_operators(l_x=self.l_x, l_y=self.l_y)
+            default_kappa = 0.1 * (omega_x ** 2 + omega_y ** 2)
+            kappa_tear = float(self.kappa_tear) if self.kappa_tear is not None else default_kappa
+            kappa_fold = float(self.kappa_fold) if self.kappa_fold is not None else default_kappa
+            L_shape         = None
+            L_shape_diag    = None
+            w               = None
+        else:
+            L_shape         = _build_gmrf_prior(
+                l_x=self.l_x,
+                l_y=self.l_y,
+                shape=self.reg_shape
+            ) 
+            L_shape_diag    = L_shape.diagonal().clone()
+
+        # Initialize variational parameters
+        mu_x    = torch.zeros(P, dtype=torch.float32, device=device)
+        mu_y    = torch.zeros(P, dtype=torch.float32, device=device)
+
+        _diag0  = L_shape_diag if L_shape_diag is not None else (_build_gmrf_prior(self.l_x, self.l_y, "bending").diagonal())
+        v_x     = (1.0 / (self.alpha_init * _diag0).clamp(min=1e-8)).clone()
+        v_y     = (1.0 / (self.alpha_init * _diag0).clamp(min=1e-8)).clone()
+        r       = torch.full((N,), self.pi0_init, dtype=torch.float32, device=device)
+        pi0     = self.pi0_init
+        alpha   = self.alpha_init
+
+        # Use data spread if not supplied by user
+        if self.sigma_in_init is not None: 
+            sigma2_in = float(self.sigma_in_init)
+        else:
+            sigma2_in = (omega_x ** 2 + omega_y ** 2) / 8.0
+
+        #  Diagnostics
+        elbo_history:       list[float]         = []
+        delta_history:      list[torch.Tensor]  = []
+        diff_history:       list[torch.Tensor]  = []
+        inlier_history:     list[torch.Tensor]  = []
+        tear_gate_history:  list[float]         = []
+        fold_gate_history:  list[float]         = []
+
+        # Convergence bookkeeping
+        elbo_prev           = None
+        rel_improve         = 0.0
+        no_improve_count    = 0
+
+        # CAVI Loop
+        with tqdm(total=self.n_iters, desc="Maximizing ELBO") as pbar:
+            for it in range(self.n_iters):
+                # [1] Responsibilities (expectation step)
+                r = self._update_responsibilities(
+                    B=B,
+                    B2=B2,
+                    mu_x=mu_x,
+                    mu_y=mu_y,
+                    v_x=v_x,
+                    v_y=v_y,
+                    delta_x=delta_x,
+                    delta_y=delta_y,
+                    pi0=pi0,
+                    sigma2_in=sigma2_in,
+                    log_ell_out=log_ell_out
+                )
+                inlier_history.append(r)
+
+                # [2] Inlier rate 
+                pi0 = float(r.mean().clamp(1e-3, 1.0 - 1e-3))
+
+                if self.discontinuity_aware:
+                    w = self._update_edge_weights(
+                        mu_x=mu_x,
+                        mu_y=mu_y,
+                        v_x=v_x,
+                        v_y=v_y,
+                        ops=ops,
+                        kappa_tear=kappa_tear,
+                        kappa_fold=kappa_fold
+                    )
+
+                    L_shape = self._build_weighted_gmrf(ops, w)
+                    L_shape_diag = L_shape.diagonal().clone()
+
+                    if self.allow_tears:
+                        tear_cat = torch.cat([w["w1x"], w["w1y"]])
+                        tear_gate_history.append(float(tear_cat.mean()) if tear_cat.numel() > 0 else 1.0)
+                    if self.allow_folds:
+                        fold_cat = torch.cat([w["w2x"], w["w2y"]])
+                        tear_gate_history.append(float(fold_cat.mean()) if fold_cat.numel() > 0 else 1.0)
+
+                # [3] Field posterior (both x- and y-components)
+                mu_x, v_x = self._update_field(
+                    B=B,
+                    B2=B2,
+                    r=r,
+                    delta=delta_x,
+                    L0=L_shape,
+                    L0_diag=L_shape_diag,
+                    alpha=alpha,
+                    sigma2_in=sigma2_in
+                )
+
+                mu_y, v_y = self._update_field(
+                    B=B,
+                    B2=B2,
+                    r=r,
+                    delta=delta_y,
+                    L0=L_shape,
+                    L0_diag=L_shape_diag,
+                    alpha=alpha,
+                    sigma2_in=sigma2_in
+                )
+
+                # [4] Lean sigma2_in
+                sigma2_in = float(self._update_sigma_in(
+                    B=B,
+                    B2=B2,
+                    mu_x=mu_x,
+                    mu_y=mu_y,
+                    v_x=v_x,
+                    v_y=v_y,
+                    r=r,
+                    delta_x=delta_x,
+                    delta_y=delta_y
+                ))
+
+                # [5] Learn alpha
+                alpha = float(self._update_alpha(
+                    mu_x=mu_x,
+                    mu_y=mu_y,
+                    v_x=v_x,
+                    v_y=v_y,
+                    L0=L_shape,
+                    L0_diag=L_shape_diag,
+                    P=P,
+                    alpha_max=self.alpha_max
+                ))
+
+                # [6] Jacobian barrier
+                if self.barrier_alpha > 0.0:
+                    barrier_weight = None
+                    if self.discontinuity_aware and self.allow_folds and self.barrier_suppression:
+                        node_suppression = self._fold_suppression_by_node(ops, w, P)
+                        barrier_weight = B @ node_suppression
+
+                    mu_x, mu_y = self._jacobian_barrier_step(
+                        x=src_x,
+                        origin=origin,
+                        h=h,
+                        mu_x=mu_x,
+                        mu_y=mu_y,
+                        barrier_weight=barrier_weight
+                    )
+
+                # [7] ELBO
+                elbo = self._compute_elbo(
+                    B=B,
+                    B2=B2,
+                    mu_x=mu_x,
+                    mu_y=mu_y,
+                    v_x=v_x,
+                    v_y=v_y,
+                    r=r,
+                    pi0=pi0,
+                    delta_x=delta_x,
+                    delta_y=delta_y,
+                    L0=L_shape,
+                    L0_diag=L_shape_diag,
+                    alpha=alpha,
+                    sigma2_in=sigma2_in,
+                    log_ell_out=log_ell_out
+                )
+                elbo_val = float(elbo.item())
+                elbo_history.append(elbo_val)
+
+                if elbo_prev is not None:
+                    rel_improve = abs(elbo_val - elbo_prev) / (abs(elbo_val) + 1e-8)
+                    no_improve_count = no_improve_count + 1 if rel_improve < self.tolerance else 0
+                elbo_prev = elbo_val
+
+                # Diagnostic deformation snapshots
+                delta_src = self._apply_internal_deformation(
+                    x=src_x.clone(),
+                    origin=origin,
+                    h=h,
+                    l_x=self.l_x,
+                    l_y=self.l_y,
+                    mu_x=mu_x,
+                    mu_y=mu_y
+                )
+                delta_history.append(delta_src)
+
+                diff_src = self._compute_displacement_targets(
+                    src_x=delta_src,
+                    tgt_x=tgt_x,
+                    tgt_scores=tgt_scores,
+                    use_softmax=True
+                )
+                diff_history.append(diff_src)
+
+                postfix = {
+                    "ELBO":       f"{elbo_val:.4f}",
+                    "ΔELBO":      f"{rel_improve:.2e}" if elbo_prev is not None else "NA",
+                    "pi0":        f"{pi0:.3f}",
+                    "σ_in":       f"{math.sqrt(max(sigma2_in, 0.0)):.3f}",
+                    "α":          f"{alpha:.3f}",
+                    "stop_count": f"{no_improve_count}/{self.patience}",
+                }
+
+                if self.allow_tears:
+                    postfix["tear_w"] = f"{tear_gate_history[-1]:.2f}"
+                if self.allow_folds:
+                    postfix["fold_w"] = f"{fold_gate_history[-1]:.2f}"
+                pbar.set_postfix(postfix)
+                pbar.update(1)
+
+                if it >= self.min_iters and no_improve_count >= self.patience:
+                    pbar.set_description("Converged (ELBO)")
+                    break
+
+        elapsed = time.perf_counter()
+        sigma_in_final = math.sqrt(max(sigma2_in, 0.0))
+        extra_log = ""
+        if self.allow_tears:
+            extra_log += f" | mean_tear_w={tear_gate_history[-1]:.2f}"
+        if self.allow_folds:
+            extra_log += f" | mean_fold_w={fold_gate_history[-1]:.2f}"
+        print(
+            f"[Registration v3] {elapsed:.2f}s | "
+            f"ELBO={elbo_history[-1]:.2f} | inlier_rate={pi0:.3f} | "
+            f"σ_in={sigma_in_final:.2f} | α={alpha:.3f} | "
+            f"n_inliers≈{int(r.sum())}/{N}{extra_log}"
+        )
+
+        return _NRRegistrationResult(
+            mu_x=mu_x,
+            mu_y=mu_y,
+            v_x=v_x,
+            v_y=v_y,
+            r=r,
+            pi0=pi0,
+            sigma_in=sigma_in_final,
+            alpha=alpha,
+            elbo_hist=elbo_history,
+            delta_hist=delta_history,
+            diff_hist=diff_history,
+            inlier_hist=inlier_history,
+            elapsed=elapsed,
+            Lx=self.l_x,
+            Ly=self.l_y,
+            grid_origin=origin,
+            h=h,
+            tear_weight_x=w["w1x"] if (self.discontinuity_aware and self.allow_tears) else None,
+            tear_weight_y=w["w1y"] if (self.discontinuity_aware and self.allow_tears) else None,
+            fold_weight_x=w["w2x"] if (self.discontinuity_aware and self.allow_folds) else None,
+            fold_weight_y=w["w2y"] if (self.discontinuity_aware and self.allow_folds) else None,
+            tear_gate_hist=tear_gate_history,
+            fold_gate_hist=fold_gate_history,
+        )
+
+
+    @staticmethod
+    def _compute_displacement_targets(
+        src_x: torch.Tensor,
+        tgt_x: torch.Tensor,
+        tgt_scores: torch.Tensor,
+        use_softmax: bool = True
+    ) -> torch.Tensor:
+        w = F.softmax(tgt_scores, dim=1) if use_softmax else tgt_scores
+        y_hat = (w.unsqueeze(2) * tgt_x).sum(dim=1)
+        return y_hat - src_x
+
+
+    def _compute_grid(
+        self,
+        x: torch.Tensor
+    ) -> Tuple[torch.Tensor, float]:
+        xy_min = x.min(dim=0).values
+        xy_max = x.max(dim=0).values
+
+        extent_x = (xy_max[0] - xy_min[0]).item()
+        extent_y = (xy_max[1] - xy_min[1]).item()
+        hx = extent_x / max(self.l_x - 3, 1)
+        hy = extent_y / max(self.l_y - 3, 1)
+        h = float(max(hx, hy, 1e-6))
+
+        origin = xy_min - 1.5 * h
+        return origin, h
+
+
+    # CAVI Update 1 - Responsibilities
+    def _update_responsibilities(
+        self,
+        B:              torch.Tensor,
+        B2:             torch.Tensor,
+        mu_x:           torch.Tensor,
+        mu_y:           torch.Tensor,
+        v_x:            torch.Tensor,
+        v_y:            torch.Tensor,
+        delta_x:        torch.Tensor,
+        delta_y:        torch.Tensor,
+        pi0:            float,
+        sigma2_in:      float,
+        log_ell_out:    float
+    ) -> torch.Tensor:
+        """
+        Computed in log-space using logaddexp for numerical stability
+        """
+        pred_x = B @ mu_x
+        pred_y = B @ mu_y
+
+        pvar_x = sigma2_in + B2 @ v_x
+        pvar_y = sigma2_in + B2 @ v_y
+
+        log_ell_in = (
+            _log_normal(delta_x, pred_x, pvar_x)
+            + _log_normal(delta_y, pred_y, pvar_y)
+        )
+
+        log_pi0     = math.log(max(pi0,       1e-12))
+        log1mpi0    = math.log(max(1.0 - pi0, 1e-12))
+
+        log_num     = log_pi0 + log_ell_in
+        log_denom   = torch.logaddexp(log_num, torch.full_like(log_num, log1mpi0 + log_ell_out))
+
+        return (log_num - log_denom).exp().clamp(1e-6, 1.0 - 1e-6)
+
+
+    # CAVI Update 3 - Field posterior
+    @staticmethod
+    def _update_field(
+        B:              torch.Tensor,
+        B2:             torch.Tensor,
+        r:              torch.Tensor,
+        delta:          torch.Tensor,
+        L0:             torch.Tensor,
+        L0_diag:        torch.Tensor,
+        alpha:          float,
+        sigma2_in:      float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rB      = r.unsqueeze(1) * B
+        BtRB    = rB.T @ B
+        H       = BtRB / sigma2_in + alpha * L0
+
+        rhs     = (rB * delta.unsqueeze(1)).sum(dim=0) / sigma2_in
+        mu      = torch.linalg.solve(H, rhs)
+
+        data_prec   = (r.unsqueeze(1) * B2).sum(dim=0) / sigma2_in
+        v           = 1.0 / (alpha * L0_diag + data_prec).clamp(1e-12)
+
+        return mu, v
+
+
+    # CAVI Update 4 - sigma-in
+    def _update_sigma_in(
+        B:              torch.Tensor,
+        B2:             torch.Tensor,
+        mu_x:           torch.Tensor,
+        mu_y:           torch.Tensor,
+        v_x:            torch.Tensor,
+        v_y:            torch.Tensor,
+        r:              torch.Tensor,
+        delta_x:        torch.Tensor,
+        delta_y:        torch.Tensor
+    ) -> torch.Tensor:
+        pred_x  = B @ mu_x
+        pred_y  = B @ mu_y
+        pvar_x  = B2 @ v_x
+        pvar_y  = B2 @ v_y
+
+        sq_res_x = (delta_x - pred_x).pow(2) + pvar_x
+        sq_res_y = (delta_y - pred_y).pow(2) + pvar_y
+
+        numerator   = (r * (sq_res_x + sq_res_y)).sum()
+        denominator = 2.0 * r.sum().clamp(min=1e-8)
+
+        return (numerator / denominator).clamp(min=1e-8)
+
+
+    # CAVI Update 5 - alpha
+    @staticmethod
+    def _update_alpha(
+        mu_x:           torch.Tensor,
+        mu_y:           torch.Tensor,
+        v_x:            torch.Tensor,
+        v_y:            torch.Tensor,
+        L0:             torch.Tensor,
+        L0_diag:        torch.Tensor,
+        P:              int,
+        alpha_max:      float
+    ) -> torch.Tensor:
+        device = _get_device()
+        quad_x  = mu_x @ (L0 @ mu_x)
+        quad_y  = mu_y @ (L0 @ mu_y)
+        trace_x = (L0_diag * v_x).sum()
+        trace_y = (L0_diag * v_y).sum()
+
+        denom = (quad_x + quad_y + trace_x + trace_y).clamp(min=1e-12)
+        alpha = float(P) / denom
+
+        return alpha.clamp(max=alpha_max) if isinstance(alpha, torch.Tensor) else torch.Tensor(alpha, dtype=torch.float32, device=device).clamp(max=alpha_max)
+
+
+    def _update_edge_weights(
+        self,
+        mu_x:           torch.Tensor,
+        mu_y:           torch.Tensor,
+        v_x:            torch.Tensor,
+        v_y:            torch.Tensor,
+        ops:            dict,
+        kappa_tear:     float,
+        kappa_fold:     float
+    ) -> dict:
+        device = _get_device()
+        
+        def _edge_weight(D: torch.Tensor, kappa: float) -> torch.Tensor:
+            if D.shape[0] == 0:
+                return torch.zeros(0, dtype=torch.float32, device=device)
+            t_x = D @ mu_x
+            t_y = D @ mu_y
+            var_x = D.pow(2) @ v_x
+            var_y = D.pow(2) @ v_y
+
+            s = t_x.pow(2) + t_y.pow(2) + var_x + var_y
+            return _geman_mcclure_weight(residual_sq=s, kappa=kappa)
+
+        w: dict = {}
+
+        if self.allow_tears:
+            w["w1x"] = _edge_weight(ops["l1x"], kappa_tear)
+            w["w1y"] = _edge_weight(ops["l1y"], kappa_tear)
+        else:
+            w["w1x"] = torch.zeros(ops["l1x"].shape[0], dtype=torch.float32, device=device)
+            w["w1y"] = torch.zeros(ops["l1y"].shape[0], dtype=torch.floar32, device=device)
+
+        if self.allow_folds:
+            w["w2x"] = _edge_weight(ops["l2x"], kappa_fold)
+            w["w2y"] = _edge_weight(ops["l2y"], kappa_fold)
+        else:
+            w["w2x"] = torch.ones(ops["l2x"].shape[0], dtype=torch.float32, device=device)
+            w["w2y"] = torch.ones(ops["l2y"].shape[0], dtype=torch.float32, device=device)
+        
+        return w
+
+
+    @staticmethod
+    def _build_weighted_gmrf(
+        ops:            dict,
+        w:              dict
+    ) -> torch.Tensor:
+        device = _get_device()
+        P = ops["l1x"].shape[1] if ops["l1x"].shape[1] > 0 else ops["l2x"].shape[1]
+        L = torch.zeros(P, P, dtype=torch.float32, device=device)
+
+        for key_D, key_w in (("l1x", "w1x"), ("l1y", "w1y"), ("l2x", "w2x"), ("l2y", "w2y")):
+            D = ops[key_D]
+            if D.shape[0] == 0:
+                continue
+        
+            wv = w[key_w]
+            L += D.T @ (D * wv.unsqueeze(1))
+        
+        L += 1e-5 * torch.eye(P, dtype=torch.float32, device=device)
+        return L
+
+
+    @staticmethod
+    def _fold_suppression_by_node(
+        ops:            dict,
+        w:              dict,
+        P:              int
+    ) -> torch.Tensor:
+        device = _get_device()
+        suppression = torch.ones(P, dtype=torch.float32, device=device)
+
+        for key_D, key_w in (("l2x", "w2x"), ("l2y", "w2y")):
+            D = ops[key_D]
+            if D.shape[0] == 0:
+                continue
+
+            wv = w[key_w]
+            rows, cols = torch.nonzero(D, as_tuple=True)
+            vals = wv[rows]
+            suppression.scatter_reduce_(0, cols, vals, reduce="amin", include_self=True)
+        
+        return suppression
+
+
+    # CAVI Update 6 - Jacobian barrier
+    def _jacobian_barrier_step(
+        self,
+        x:              torch.Tensor,
+        origin:         torch.Tensor,
+        h:              float,
+        mu_x:           torch.Tensor,
+        mu_y:           torch.Tensor,
+        barrier_weight: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        l_x, l_y = self.l_x, self.l_y
+
+        dBdx = _build_design_matrix_derivative(
+            x=x,
+            origin=origin,
+            h=h,
+            l_x=l_x,
+            l_y=l_y,
+            axis=0
+        )
+        dBdy = _build_design_matrix_derivative(
+            x=x,
+            origin=origin,
+            h=h,
+            l_x=l_x,
+            l_y=l_y,
+            axis=1
+        )
+
+        gamma = self.barrier_alpha if barrier_weight is None else self.barrier_alpha * barrier_weight
+
+        for _ in range(self.barrier_steps):
+            mux = mu_x.detach().requires_grad_(True)
+            muy = mu_y.detach().requires_grad_(True)
+
+            # Construct Jacobian
+            J00 = 1.0 + dBdx @ mux
+            J01 =       dBdy @ mux
+            J10 =       dBdx @ muy
+            J11 = 1.0 + dBdy @ muy
+
+            det_J = J00 * J11 - J01 * J10
+
+            barrier_loss = -(gamma * det_J.clamp(min=1e-4).log()).sum()
+            barrier_loss.backward()
+
+            with torch.no_grad():
+                mu_x = (mu_x - self.barrier_lr * mux.grad()).detach()
+                mu_y = (mu_y - self.barrier_lr * muy.grad()).detach()
+
+        return mu_x, mu_y
+
+
+    @staticmethod
+    def _compute_elbo(
+        B:              torch.Tensor,
+        B2:             torch.Tensor,
+        mu_x:           torch.Tensor,
+        mu_y:           torch.Tensor,
+        v_x:            torch.Tensor,
+        v_y:            torch.Tensor,
+        r:              torch.Tensor,
+        pi0:            float,
+        delta_x:        torch.Tensor,
+        delta_y:        torch.Tensor,
+        L0:             torch.Tensor,
+        L0_diag:        torch.Tensor,
+        alpha:          float,
+        sigma2_in:      float,
+        log_ell_out:    float     
+    ) -> torch.Tensor:
+        log2pi  = math.log(2.0 * math.pi)
+        eps     = 1e-10
+
+        pred_x  = B @ mu_x
+        pred_y  = B @ mu_y
+
+        pvar_x  = B2 @ v_x
+        pvar_y  = B2 @ v_y
+
+        bias2_x     = (delta_x - pred_x).pow(2)
+        bias2_y     = (delta_y - pred_y).pow(2)
+        inlier_ll   = r * (
+            -float(log2pi + math.log(sigma2_in))
+            - 0.5 * (bias2_x + pvar_x + bias2_y + pvar_y) / sigma2_in
+        )
+        outlier_ll = (1.0 - r) * log_ell_out
+        term_A = (inlier_ll + outlier_ll).sum()
+
+        def _neg_kl_field(
+            mu: torch.Tensor,
+            v: torch.Tensor
+        ) -> torch.Tensor:
+            return 0.5 * (
+                v.clamp(eps).log().sum()
+                - alpha * (L0_diag * v).sum()
+                - alpha * (mu @ (L0 @ mu))
+            )
+
+        term_B = _neg_kl_field(mu_x, v_x) + _neg_kl_field(mu_y, v_y)
+
+        term_C = -(
+            r * (r.clamp(eps).log() - math.log(pi0 + eps))
+            + (1.0 - r) * ((1.0 - r).clamp(eps).log() - math.log(1.0 - pi0 + eps))
+        ).sum()
+
+        return term_A + term_B + term_C
