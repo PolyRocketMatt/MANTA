@@ -1,7 +1,8 @@
 import anndata as ad
 import numpy as np
+import torch
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from ..core.alignment._rigid import (
     _aggregate,
@@ -15,6 +16,10 @@ from ..core.alignment._non_rigid import (
 from ..utils._progress import (
     _get_progress,
     _update_progress,
+)
+from ..utils._tensor_utils import (
+    _get_device,
+    _as_tensor,
 )
 
 
@@ -184,12 +189,68 @@ def non_rigid(
     rho_src: float = 1.0,
     rho_tgt: float = 1.0,
     num_sinkhorn_iters: int = 50,
+
+    # Probabilistic registration parameters
+    l_x: int = 32,
+    l_y: int = 32,
+    regularisation_shape: Literal["bending", "membrane", "combined"] = "bending",
+
+    pi0_init: float = 0.8,
+    sigma_in_init: float | None = None,
+    alpha_init: float = 1.0,
+    alpha_max: float = 1e6,
+    
+    barrier_alpha: float = 1e-3,
+    barrier_lr: float = 0.5,
+    barrier_steps: int = 3,
+
+    tolerance: float = 1e-4,
+    patience: int = 5,
+    min_iters: int = 5,
+    n_iters: int = 20,
+
+    discontinuity_aware: bool = False,
+    allow_tears: bool = True,
+    allow_folds: bool = True,
+    kappa_tear: float | None = None,
+    kappa_fold: float | None = None,
+    fold_barrier_suppression: bool = True
 ):
-    _match(
-        source=source,
-        target=target,
-        embedding_key=embedding_key,
-        clustering_key=clustering_key,
+    device = _get_device()
+
+    # Extract embedding
+    src_embedding_dict = source.uns.get(embedding_key)
+    tgt_embedding_dict = target.uns.get(embedding_key)
+    
+    if src_embedding_dict is None:
+        raise ValueError(
+            f"expected embedding to be of type `dict`, got `None`"
+        )
+    if tgt_embedding_dict is None:
+        raise ValueError(
+            f"expected embedding to be of type `dict`, got `None`"
+        )
+
+    # Extract clustering
+    src_clustering_dict = source.uns.get(clustering_key)
+    tgt_clustering_dict = target.uns.get(clustering_key)
+
+    if src_clustering_dict is None:
+        raise ValueError(
+            f"expected clustering to be of type `dict`, got `None`"
+        )
+    if tgt_clustering_dict is None:
+        raise ValueError(
+            f"expected clustering to be of type `dict`, got `None`"
+        )
+
+    transport_dict = _match(
+        src_embedding_dict=src_embedding_dict,
+        tgt_embedding_dict=tgt_embedding_dict,
+
+        src_clustering_dict=src_clustering_dict,
+        tgt_clustering_dict=tgt_clustering_dict,
+        
         top_n_clusters=top_n_clusters,
         top_k_matches=top_k_matches,
         alpha=alpha,
@@ -201,3 +262,13 @@ def non_rigid(
         rho_tgt=rho_tgt,
         num_sinkhorn_iters=num_sinkhorn_iters
     )
+
+    # Set matching dict for potential plotting
+    source.uns["matching"] = transport_dict
+    target.uns["matching"] = transport_dict
+
+    src_anchors = src_embedding_dict["pts"]
+    tgt_anchors = (tgt_embedding_dict["pts"])[transport_dict["target_idx"]]
+
+    print(tgt_anchors.shape)
+

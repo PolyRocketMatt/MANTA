@@ -252,11 +252,11 @@ def _extract_topk(
 
 
 def _match(
-    source: ad.AnnData,
-    target: ad.AnnData,
+    src_embedding_dict: dict,
+    tgt_embedding_dict: dict,
 
-    embedding_key: str | None = None,
-    clustering_key: str | None = None,
+    src_clustering_dict: dict,
+    tgt_clustering_dict: dict,
 
     top_n_clusters: int = 5,
     top_k_matches: int = 10,
@@ -270,26 +270,8 @@ def _match(
     rho_src: float = 1.0,
     rho_tgt: float = 1.0,
     num_sinkhorn_iters: int = 50,
-):
-    if embedding_key is None:
-        raise ValueError("expected valid embedding_key, got None")
-    if clustering_key is None:
-        raise ValueError("expected valid clustering_key, got None")
-    
+):  
     device = _get_device()
-
-    # Extract embedding
-    src_embedding_dict = source.uns.get(embedding_key)
-    tgt_embedding_dict = target.uns.get(embedding_key)
-    
-    if src_embedding_dict is None:
-        raise ValueError(
-            f"expected embedding to be of type `dict`, got `None`"
-        )
-    if tgt_embedding_dict is None:
-        raise ValueError(
-            f"expected embedding to be of type `dict`, got `None`"
-        )
 
     src_embedding = _as_tensor(src_embedding_dict["embedding"], dtype=torch.float32, device=device)
     tgt_embedding = _as_tensor(tgt_embedding_dict["embedding"], dtype=torch.float32, device=device)
@@ -300,20 +282,6 @@ def _match(
     tgt_pts = _as_tensor(tgt_embedding_dict["pts"], dtype=torch.float32, device=device)
     src_idx = _as_tensor(src_embedding_dict["indices"], dtype=torch.int64, device=device)
     tgt_idx = _as_tensor(tgt_embedding_dict["indices"], dtype=torch.int64, device=device)
-
-
-    # Extract clustering
-    src_clustering_dict = source.uns.get(clustering_key)
-    tgt_clustering_dict = target.uns.get(clustering_key)
-
-    if src_clustering_dict is None:
-        raise ValueError(
-            f"expected clustering to be of type `dict`, got `None`"
-        )
-    if tgt_clustering_dict is None:
-        raise ValueError(
-            f"expected clustering to be of type `dict`, got `None`"
-        )
 
     src_clustering_soft = _as_tensor(src_clustering_dict["soft_cluster_probs"], dtype=torch.float32, device=device)
     tgt_clustering_soft = _as_tensor(tgt_clustering_dict["soft_cluster_probs"], dtype=torch.float32, device=device)
@@ -376,9 +344,6 @@ def _match(
         "probs": out_probs,
         "P": log_pi
     } 
-
-    source.uns["matching"] = transport_dict
-    target.uns["matching"] = transport_dict
 
     return transport_dict
 
@@ -971,19 +936,24 @@ class _ProbabilisticRegistration:
             mu_y=mu_y,
             v_x=v_x,
             v_y=v_y,
+
             r=r,
+            
             pi0=pi0,
             sigma_in=sigma_in_final,
             alpha=alpha,
+            
             elbo_hist=elbo_history,
             delta_hist=delta_history,
             diff_hist=diff_history,
             inlier_hist=inlier_history,
             elapsed=elapsed,
-            Lx=self.l_x,
-            Ly=self.l_y,
-            grid_origin=origin,
+            
+            l_x=self.l_x,
+            l_y=self.l_y,
+            origin=origin,
             h=h,
+
             tear_weight_x=w["w1x"] if (self.discontinuity_aware and self.allow_tears) else None,
             tear_weight_y=w["w1y"] if (self.discontinuity_aware and self.allow_tears) else None,
             fold_weight_x=w["w2x"] if (self.discontinuity_aware and self.allow_folds) else None,
