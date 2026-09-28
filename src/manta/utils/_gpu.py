@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from typing import Iterable, Literal, Optional, Tuple
-from torch_cluster import knn_graph
+from torch_geometric.nn import knn_graph
 
 from ..utils._tensor_utils import (
     TensorLike,
@@ -284,7 +284,7 @@ def _kmeans(
     # Final assignment (for all N)
     labels = torch.empty(N, device=device, dtype=torch.long)
     for s, e in _chunked_range(N, batch_size):
-        dist = _pairwise_dist(fit_x[s:e], centroids, dist_fn)
+        dist = _pairwise_dist(x[s:e], centroids, dist_fn)
         labels[s:e] = torch.argmin(dist, dim=1)
 
     return labels, centroids

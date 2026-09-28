@@ -3,7 +3,9 @@ import math
 import torch
 import torch.nn.functional as F
 
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from scipy.interpolate import griddata
+from typing import List, Literal, Tuple
 
 from ...utils._gpu import (
     _chunked_range
@@ -33,6 +35,14 @@ def _scatter_logsumexp(
     exp_sum.scatter_add_(0, index, shifted)
 
     return max_vals + exp_sum.clamp(min=1e-40).log()
+
+
+def _log_normal(
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    var: torch.Tensor
+) -> torch.Tensor:
+    return -0.5 * (math.log(2.0 * math.pi) + var.log() + (x - mean).pow(2.0) / var)
 
 
 def _build_sparse_transport_costs(
@@ -369,3 +379,122 @@ def _match(
     target.uns["matching"] = transport_dict
 
     return transport_dict
+
+
+def _cubic_bspline(u: torch.Tensor) -> torch.Tensor:
+    a = u.abs()
+    out = torch.zeros_like(u)
+
+    m1 = a < 1.0
+    out[m1] = (2.0 / 3.0) - a[m1].pow(2) + 0.5 * a[m1].pow(3)
+
+    m2 = (a >= 1.0) & (a < 2.0)
+    out[m2] = (2.0 - a[m2]).pow(3) / 6.0
+
+    return out
+
+
+def _cubic_bspline_derivative(u: torch.Tensor) -> torch.Tensor:
+    a = u.abs()
+    out = torch.zeros_like(u)
+
+    m1 = a < 1
+    out[m1] = -2.0 * u[m1] + 1.5 * u[m1] * a[m1]
+
+    m2 = (a >= 1.0) & (a < 2.0)
+    out[m2] = -(2.0 - a[m2]).pow(2) / 2.0 * u[m2].sign()
+
+    return out
+
+
+# TODO - This needs to be converted to a dimensionless representation to work in 3D/4D
+def _build_design_matrix(
+    x: torch.Tensor,
+    origin: torch.Tensor,
+    h: float,
+    l_x: int,
+    l_y: int
+) -> torch.Tensor:
+    device = _get_device()
+    u = (x - origin.unsqueeze(0)) / h
+
+    l_idx = torch.arange(l_x, dtype=torch.float32, device=device)
+    m_idx = torch.arange(l_y, dtype=torch.float32, device=device)
+
+    # Evaluate B-spline kernel along each axis
+    b_x = _cubic_bspline(u[:, 0:1] - l_idx.unsqueeze(0))
+    b_y = _cubic_bspline(u[:, 1:2] - m_idx.unsqueeze(0))
+
+    # 2D outer product per node
+    B = (b_x.unsqueeze(2) * b_y.unsqueeze(2)).reshape(-1, l_x * l_y)
+    return B
+
+
+# TODO - This needs to be converted to a dimensionless representation to work in 3D/4D
+def _build_design_matrix_derivative(
+    x: torch.Tensor,
+    origin: torch.Tensor,
+    h: float,
+    l_x: int,
+    l_y: int,
+    axis: int
+) -> torch.Tensor:
+    device = _get_device()
+    u = (x - origin.unsqueeze(0)) / h
+
+    l_idx = torch.arange(l_x, dtype=torch.float32, device=device)
+    m_idx = torch.arange(l_y, dtype=torch.float32, device=device)
+
+    b_x = _cubic_bspline(u[:, 0:1] - l_idx.unsqueeze(0))
+    b_y = _cubic_bspline(u[:, 1:2] - m_idx.unsqueeze(0))
+
+    db_x = _cubic_bspline_derivative(u[:, 0:1] - l_idx.unsqueeze(0))
+    db_y = _cubic_bspline_derivative(u[:, 1:2] - m_idx.unsqueeze(0))
+
+    if axis == 0:
+        dB = ((db_x / h).unsqueeze(2) * b_y.unsqueeze(1)).reshape(-1, l_x * l_y)
+    else:
+        dB = (b_x.unsqueeze(2) * (db_y / h).unsqueeze(1)).reshape(-1, l_x * l_y)
+    return dB
+
+
+def _build_diff_operators(l_x: int, l_y: int) -> dict:
+    device = _get_device()
+    P = l_x * l_y
+    I_x = torch.eye(l_x, dtype=torch.float32, device=device)
+    I_y = torch.eye(l_y, dtype=torch.float32, device=device)
+
+    def _diff1(L: int) -> torch.Tensor:
+        D =  torch.zeros(max(L - 1, 0), L, dtype=torch.float32, device=device)
+        if L > 1:
+            idx = torch.arange(L - 1, device=device)
+            D[idx, idx]     = -1.0
+            D[idx, idx + 1] =  1.0
+        return D
+
+    def _diff2(L: int) -> torch.Tensor:
+        D = torch.zeros(max(L - 2, 0), L, dtype=torch.float32, device=device)
+        if L > 2:
+            idx = torch.arange(L - 1, device=device)
+            D[idx, idx]     =  1.0
+            D[idx, idx + 1] = -2.0
+            D[idx, idx + 2] = 1.0
+        return D
+
+    ops: dict = {}
+
+    if l_x > 1 and l_y > 1:
+        ops["l1x"] = torch.kron(_diff1(l_x), I_y)
+        ops["l1y"] = torch.kron(I_x, _diff1(l_y))
+    else:
+        ops["L1x"] = torch.zeros(0, P, dtype=torch.float32, device=device)
+        ops["L1y"] = torch.zeros(0, P, dtype=torch.float32, device=device)
+
+    if l_x > 2 and l_y > 2:
+        ops["l2x"] = torch.kron(_diff2(l_x), I_y)
+        ops["l2y"] = torch.kron(I_x, _diff2(l_y))
+    else:
+        ops["l2x"] = torch.zeros(0, P, dtype=torch.float32, device=device)
+        ops["l2y"] = torch.zeros(0, P, dtype=torch.float32, device=device)
+
+    return ops
