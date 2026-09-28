@@ -11,7 +11,8 @@ from ..core.alignment._rigid import (
     _ransac
 )
 from ..core.alignment._non_rigid import (
-    _match
+    _match,
+    _ProbabilisticRegistration
 )
 from ..utils._progress import (
     _get_progress,
@@ -20,6 +21,7 @@ from ..utils._progress import (
 from ..utils._tensor_utils import (
     _get_device,
     _as_tensor,
+    _from_tensor
 )
 
 
@@ -174,11 +176,13 @@ def non_rigid(
     source: ad.AnnData,
     target: ad.AnnData,
 
+    spatial_key: str = "spatial_manta",
+
     embedding_key: str | None = None,
     clustering_key: str | None = None,
 
     top_n_clusters: int = 5,
-    top_k_matches: int = 10,
+    top_k_matches: int = 5,
     alpha: float = 1.0,
     beta: float = 1.0,
     gamma: float = 1.0,
@@ -268,7 +272,52 @@ def non_rigid(
     target.uns["matching"] = transport_dict
 
     src_anchors = src_embedding_dict["pts"]
-    tgt_anchors = (tgt_embedding_dict["pts"])[transport_dict["target_idx"]]
+    tgt_indices = transport_dict["target_idx"]
+    tgt_scores  = transport_dict["scores"]
+    tgt_anchors = _as_tensor(target.obsm[spatial_key], dtype=torch.float32, device=device)[tgt_indices]
 
-    print(tgt_anchors.shape)
+    registration = _ProbabilisticRegistration(
+        l_x=l_x,
+        l_y=l_y,
+        regularisation_shape=regularisation_shape,
 
+        pi0_init=pi0_init,
+        sigma_in_init=sigma_in_init,
+        alpha_init=alpha_init,
+        alpha_max=alpha_max,
+
+        barrier_alpha=barrier_alpha,
+        barrier_lr=barrier_lr,
+        barrier_steps=barrier_steps,
+
+        tolerance=tolerance,
+        patience=patience,
+        min_iters=min_iters,
+        n_iters=n_iters,
+
+        discontinuity_aware=discontinuity_aware,
+        allow_tears=allow_tears,
+        allow_folds=allow_folds,
+        kappa_tear=kappa_tear,
+        kappa_fold=kappa_fold,
+        fold_barrier_suppression=fold_barrier_suppression
+    )
+
+    result = registration.fit(
+        src_x=src_anchors,
+        tgt_x=tgt_anchors,
+        tgt_scores=tgt_scores,
+        use_softmax=True
+    )
+
+    src_untransformed = _as_tensor(source.obsm[spatial_key], dtype=torch.float32, device=device)
+    src_transformed = registration.apply_deformation(
+        x=src_untransformed, 
+        result=result
+    )
+
+    source.obsm["nonrigid"] = _from_tensor(src_transformed)
+    target.obsm["nonrigid"] = target.obsm[spatial_key]
+
+    source.uns["nonrigid"] = result
+    target.uns["nonrigid"] = result

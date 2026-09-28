@@ -12,6 +12,10 @@ from typing import List, Literal, Tuple
 from ...utils._gpu import (
     _chunked_range
 )
+from ...utils._progress import (
+    _get_progress,
+    _update_progress,
+)
 from ...utils._tensor_utils import (
     _get_device,
     _as_tensor
@@ -393,7 +397,7 @@ def _build_design_matrix(
     b_y = _cubic_bspline(u[:, 1:2] - m_idx.unsqueeze(0))
 
     # 2D outer product per node
-    B = (b_x.unsqueeze(2) * b_y.unsqueeze(2)).reshape(-1, l_x * l_y)
+    B = (b_x.unsqueeze(2) * b_y.unsqueeze(1)).reshape(-1, l_x * l_y)
     return B
 
 
@@ -442,7 +446,7 @@ def _build_diff_operators(l_x: int, l_y: int) -> dict:
     def _diff2(L: int) -> torch.Tensor:
         D = torch.zeros(max(L - 2, 0), L, dtype=torch.float32, device=device)
         if L > 2:
-            idx = torch.arange(L - 1, device=device)
+            idx = torch.arange(L - 2, device=device)
             D[idx, idx]     =  1.0
             D[idx, idx + 1] = -2.0
             D[idx, idx + 2] = 1.0
@@ -537,7 +541,7 @@ class _NRRegistrationResult:
     tear_weight_x:  torch.Tensor | None = None  # [rows(l1x)]   final tear gate, x-membrane edges
     tear_weight_y:  torch.Tensor | None = None  # [rows(l1y)]   final tear gate, y-membrane edges
     fold_weight_x:  torch.Tensor | None = None  # [rows(l2x)]   final fold gate, x-bending edges
-    fold_weight_z:  torch.Tensor | None = None  # [rows(l2y)]   final fold gate, y-bending edges
+    fold_weight_y:  torch.Tensor | None = None  # [rows(l2y)]   final fold gate, y-bending edges
     tear_gate_hist: list = field(default_factory=list)  # mean tear weight per iteration
     fold_gate_hist: list = field(default_factory=list)  # mean fold weight per iteration
 
@@ -685,6 +689,7 @@ class _ProbabilisticRegistration:
 
         # B-spline grid
         origin, h = self._compute_grid(src_x)
+
         B = _build_design_matrix(
             x=src_x,
             origin=origin,
@@ -744,180 +749,197 @@ class _ProbabilisticRegistration:
         rel_improve         = 0.0
         no_improve_count    = 0
 
+        progress, _ = _get_progress(
+            steps=self.n_iters + 1,
+            desc="Non-Rigid Alignment"
+        )
+
         # CAVI Loop
-        with tqdm(total=self.n_iters, desc="Maximizing ELBO") as pbar:
-            for it in range(self.n_iters):
-                # [1] Responsibilities (expectation step)
-                r = self._update_responsibilities(
-                    B=B,
-                    B2=B2,
+        for it in range(self.n_iters):
+            # [1] Responsibilities (expectation step)
+            r = self._update_responsibilities(
+                B=B,
+                B2=B2,
+                mu_x=mu_x,
+                mu_y=mu_y,
+                v_x=v_x,
+                v_y=v_y,
+                delta_x=delta_x,
+                delta_y=delta_y,
+                pi0=pi0,
+                sigma2_in=sigma2_in,
+                log_ell_out=log_ell_out
+            )
+            inlier_history.append(r)
+
+            # [2] Inlier rate 
+            pi0 = float(r.mean().clamp(1e-3, 1.0 - 1e-3))
+
+            if self.discontinuity_aware:
+                w = self._update_edge_weights(
                     mu_x=mu_x,
                     mu_y=mu_y,
                     v_x=v_x,
                     v_y=v_y,
-                    delta_x=delta_x,
-                    delta_y=delta_y,
-                    pi0=pi0,
-                    sigma2_in=sigma2_in,
-                    log_ell_out=log_ell_out
-                )
-                inlier_history.append(r)
-
-                # [2] Inlier rate 
-                pi0 = float(r.mean().clamp(1e-3, 1.0 - 1e-3))
-
-                if self.discontinuity_aware:
-                    w = self._update_edge_weights(
-                        mu_x=mu_x,
-                        mu_y=mu_y,
-                        v_x=v_x,
-                        v_y=v_y,
-                        ops=ops,
-                        kappa_tear=kappa_tear,
-                        kappa_fold=kappa_fold
-                    )
-
-                    L_shape = self._build_weighted_gmrf(ops, w)
-                    L_shape_diag = L_shape.diagonal().clone()
-
-                    if self.allow_tears:
-                        tear_cat = torch.cat([w["w1x"], w["w1y"]])
-                        tear_gate_history.append(float(tear_cat.mean()) if tear_cat.numel() > 0 else 1.0)
-                    if self.allow_folds:
-                        fold_cat = torch.cat([w["w2x"], w["w2y"]])
-                        tear_gate_history.append(float(fold_cat.mean()) if fold_cat.numel() > 0 else 1.0)
-
-                # [3] Field posterior (both x- and y-components)
-                mu_x, v_x = self._update_field(
-                    B=B,
-                    B2=B2,
-                    r=r,
-                    delta=delta_x,
-                    L0=L_shape,
-                    L0_diag=L_shape_diag,
-                    alpha=alpha,
-                    sigma2_in=sigma2_in
+                    ops=ops,
+                    kappa_tear=kappa_tear,
+                    kappa_fold=kappa_fold
                 )
 
-                mu_y, v_y = self._update_field(
-                    B=B,
-                    B2=B2,
-                    r=r,
-                    delta=delta_y,
-                    L0=L_shape,
-                    L0_diag=L_shape_diag,
-                    alpha=alpha,
-                    sigma2_in=sigma2_in
-                )
-
-                # [4] Lean sigma2_in
-                sigma2_in = float(self._update_sigma_in(
-                    B=B,
-                    B2=B2,
-                    mu_x=mu_x,
-                    mu_y=mu_y,
-                    v_x=v_x,
-                    v_y=v_y,
-                    r=r,
-                    delta_x=delta_x,
-                    delta_y=delta_y
-                ))
-
-                # [5] Learn alpha
-                alpha = float(self._update_alpha(
-                    mu_x=mu_x,
-                    mu_y=mu_y,
-                    v_x=v_x,
-                    v_y=v_y,
-                    L0=L_shape,
-                    L0_diag=L_shape_diag,
-                    P=P,
-                    alpha_max=self.alpha_max
-                ))
-
-                # [6] Jacobian barrier
-                if self.barrier_alpha > 0.0:
-                    barrier_weight = None
-                    if self.discontinuity_aware and self.allow_folds and self.barrier_suppression:
-                        node_suppression = self._fold_suppression_by_node(ops, w, P)
-                        barrier_weight = B @ node_suppression
-
-                    mu_x, mu_y = self._jacobian_barrier_step(
-                        x=src_x,
-                        origin=origin,
-                        h=h,
-                        mu_x=mu_x,
-                        mu_y=mu_y,
-                        barrier_weight=barrier_weight
-                    )
-
-                # [7] ELBO
-                elbo = self._compute_elbo(
-                    B=B,
-                    B2=B2,
-                    mu_x=mu_x,
-                    mu_y=mu_y,
-                    v_x=v_x,
-                    v_y=v_y,
-                    r=r,
-                    pi0=pi0,
-                    delta_x=delta_x,
-                    delta_y=delta_y,
-                    L0=L_shape,
-                    L0_diag=L_shape_diag,
-                    alpha=alpha,
-                    sigma2_in=sigma2_in,
-                    log_ell_out=log_ell_out
-                )
-                elbo_val = float(elbo.item())
-                elbo_history.append(elbo_val)
-
-                if elbo_prev is not None:
-                    rel_improve = abs(elbo_val - elbo_prev) / (abs(elbo_val) + 1e-8)
-                    no_improve_count = no_improve_count + 1 if rel_improve < self.tolerance else 0
-                elbo_prev = elbo_val
-
-                # Diagnostic deformation snapshots
-                delta_src = self._apply_internal_deformation(
-                    x=src_x.clone(),
-                    origin=origin,
-                    h=h,
-                    l_x=self.l_x,
-                    l_y=self.l_y,
-                    mu_x=mu_x,
-                    mu_y=mu_y
-                )
-                delta_history.append(delta_src)
-
-                diff_src = self._compute_displacement_targets(
-                    src_x=delta_src,
-                    tgt_x=tgt_x,
-                    tgt_scores=tgt_scores,
-                    use_softmax=True
-                )
-                diff_history.append(diff_src)
-
-                postfix = {
-                    "ELBO":       f"{elbo_val:.4f}",
-                    "ΔELBO":      f"{rel_improve:.2e}" if elbo_prev is not None else "NA",
-                    "pi0":        f"{pi0:.3f}",
-                    "σ_in":       f"{math.sqrt(max(sigma2_in, 0.0)):.3f}",
-                    "α":          f"{alpha:.3f}",
-                    "stop_count": f"{no_improve_count}/{self.patience}",
-                }
+                L_shape = self._build_weighted_gmrf(ops, w)
+                L_shape_diag = L_shape.diagonal().clone()
 
                 if self.allow_tears:
-                    postfix["tear_w"] = f"{tear_gate_history[-1]:.2f}"
+                    tear_cat = torch.cat([w["w1x"], w["w1y"]])
+                    tear_gate_history.append(float(tear_cat.mean()) if tear_cat.numel() > 0 else 1.0)
                 if self.allow_folds:
-                    postfix["fold_w"] = f"{fold_gate_history[-1]:.2f}"
-                pbar.set_postfix(postfix)
-                pbar.update(1)
+                    fold_cat = torch.cat([w["w2x"], w["w2y"]])
+                    tear_gate_history.append(float(fold_cat.mean()) if fold_cat.numel() > 0 else 1.0)
 
-                if it >= self.min_iters and no_improve_count >= self.patience:
-                    pbar.set_description("Converged (ELBO)")
-                    break
+            # [3] Field posterior (both x- and y-components)
+            mu_x, v_x = self._update_field(
+                B=B,
+                B2=B2,
+                r=r,
+                delta=delta_x,
+                L0=L_shape,
+                L0_diag=L_shape_diag,
+                alpha=alpha,
+                sigma2_in=sigma2_in
+            )
 
-        elapsed = time.perf_counter()
+            mu_y, v_y = self._update_field(
+                B=B,
+                B2=B2,
+                r=r,
+                delta=delta_y,
+                L0=L_shape,
+                L0_diag=L_shape_diag,
+                alpha=alpha,
+                sigma2_in=sigma2_in
+            )
+
+            # [4] Lean sigma2_in
+            sigma2_in = float(self._update_sigma_in(
+                B=B,
+                B2=B2,
+                mu_x=mu_x,
+                mu_y=mu_y,
+                v_x=v_x,
+                v_y=v_y,
+                r=r,
+                delta_x=delta_x,
+                delta_y=delta_y
+            ))
+
+            # [5] Learn alpha
+            alpha = float(self._update_alpha(
+                mu_x=mu_x,
+                mu_y=mu_y,
+                v_x=v_x,
+                v_y=v_y,
+                L0=L_shape,
+                L0_diag=L_shape_diag,
+                P=P,
+                alpha_max=self.alpha_max
+            ))
+
+            # [6] Jacobian barrier
+            if self.barrier_alpha > 0.0:
+                barrier_weight = None
+                if self.discontinuity_aware and self.allow_folds and self.barrier_suppression:
+                    node_suppression = self._fold_suppression_by_node(ops, w, P)
+                    barrier_weight = B @ node_suppression
+
+                mu_x, mu_y = self._jacobian_barrier_step(
+                    x=src_x,
+                    origin=origin,
+                    h=h,
+                    mu_x=mu_x,
+                    mu_y=mu_y,
+                    barrier_weight=barrier_weight
+                )
+
+            # [7] ELBO
+            elbo = self._compute_elbo(
+                B=B,
+                B2=B2,
+                mu_x=mu_x,
+                mu_y=mu_y,
+                v_x=v_x,
+                v_y=v_y,
+                r=r,
+                pi0=pi0,
+                delta_x=delta_x,
+                delta_y=delta_y,
+                L0=L_shape,
+                L0_diag=L_shape_diag,
+                alpha=alpha,
+                sigma2_in=sigma2_in,
+                log_ell_out=log_ell_out
+            )
+            elbo_val = float(elbo.item())
+            elbo_history.append(elbo_val)
+
+            if elbo_prev is not None:
+                rel_improve = abs(elbo_val - elbo_prev) / (abs(elbo_val) + 1e-8)
+                no_improve_count = no_improve_count + 1 if rel_improve < self.tolerance else 0
+            elbo_prev = elbo_val
+
+            # Diagnostic deformation snapshots
+            delta_src = self._apply_internal_deformation(
+                x=src_x.clone(),
+                origin=origin,
+                h=h,
+                l_x=self.l_x,
+                l_y=self.l_y,
+                mu_x=mu_x,
+                mu_y=mu_y
+            )
+            delta_history.append(delta_src)
+
+            diff_src = self._compute_displacement_targets(
+                src_x=delta_src,
+                tgt_x=tgt_x,
+                tgt_scores=tgt_scores,
+                use_softmax=True
+            )
+            diff_history.append(diff_src)
+
+            postfix = {
+                "ELBO":       f"{elbo_val:.4f}",
+                "ΔELBO":      f"{rel_improve:.2e}" if elbo_prev is not None else "NA",
+                "pi0":        f"{pi0:.3f}",
+                "σ_in":       f"{math.sqrt(max(sigma2_in, 0.0)):.3f}",
+                "α":          f"{alpha:.3f}",
+                "stop_count": f"{no_improve_count}/{self.patience}",
+            }
+
+            if self.allow_tears:
+                postfix["tear_w"] = f"{tear_gate_history[-1]:.2f}"
+            if self.allow_folds:
+                postfix["fold_w"] = f"{fold_gate_history[-1]:.2f}"
+
+            _update_progress(
+                progress=progress, 
+                message=f"ELBO: {elbo_val:.4f}"
+            )
+
+            if it >= self.min_iters and no_improve_count >= self.patience:
+                left = self.n_iters - it
+                for _ in range(left):
+                    _update_progress(
+                        progress=progress, 
+                        message=f"Converged"
+                    )
+                break
+
+        _update_progress(
+            progress=progress, 
+            message=f"Finished"
+        )
+
+        elapsed = time.perf_counter() - t0
         sigma_in_final = math.sqrt(max(sigma2_in, 0.0))
         extra_log = ""
         if self.allow_tears:
@@ -1056,6 +1078,7 @@ class _ProbabilisticRegistration:
 
 
     # CAVI Update 4 - sigma-in
+    @staticmethod
     def _update_sigma_in(
         B:              torch.Tensor,
         B2:             torch.Tensor,
@@ -1237,8 +1260,8 @@ class _ProbabilisticRegistration:
             barrier_loss.backward()
 
             with torch.no_grad():
-                mu_x = (mu_x - self.barrier_lr * mux.grad()).detach()
-                mu_y = (mu_y - self.barrier_lr * muy.grad()).detach()
+                mu_x = (mu_x - self.barrier_lr * mux.grad).detach()
+                mu_y = (mu_y - self.barrier_lr * muy.grad).detach()
 
         return mu_x, mu_y
 
