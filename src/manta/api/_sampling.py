@@ -3,7 +3,7 @@ import anndata as ad
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Literal
 
-from ..core._samplers import (
+from ..old._samplers import (
     _sample_importance,
     _sample_stratified,
     _sample_approximate_fps

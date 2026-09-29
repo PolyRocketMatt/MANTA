@@ -4,7 +4,7 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
 
-from ..core._preprocessing import (
+from ..old._preprocessing import (
     _pca,
     _nmf,
     _integration,

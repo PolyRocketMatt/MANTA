@@ -51,9 +51,8 @@ def _pairwise_cosine_dist(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -
 
 @torch.no_grad()
 def _chunked_range(n: int, chunk_size: int) -> Iterable[Tuple[int, int]]:
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        yield start, end
+    for s in range(0, n, chunk_size):
+        yield s, min(s + chunk_size, n)
 
 
 @torch.no_grad()

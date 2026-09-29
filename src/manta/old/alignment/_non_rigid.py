@@ -256,11 +256,16 @@ def _extract_topk(
 
 
 def _match(
+    source: ad.AnnData,
+    target: ad.AnnData,
+        
     src_embedding_dict: dict,
     tgt_embedding_dict: dict,
 
     src_clustering_dict: dict,
     tgt_clustering_dict: dict,
+
+    spatial_key: str | None = None,
 
     top_n_clusters: int = 5,
     top_k_matches: int = 10,
@@ -277,15 +282,20 @@ def _match(
 ):  
     device = _get_device()
 
+    src_pts = _as_tensor(source.obsm[spatial_key], dtype=torch.float32, device=device)
+    tgt_pts = _as_tensor(target.obsm[spatial_key], dtype=torch.float32, device=device)
+
     src_embedding = _as_tensor(src_embedding_dict["embedding"], dtype=torch.float32, device=device)
     tgt_embedding = _as_tensor(tgt_embedding_dict["embedding"], dtype=torch.float32, device=device)
 
     src_z = F.normalize(src_embedding, dim=-1)
     tgt_z = F.normalize(tgt_embedding, dim=-1)
-    src_pts = _as_tensor(src_embedding_dict["pts"], dtype=torch.float32, device=device)
-    tgt_pts = _as_tensor(tgt_embedding_dict["pts"], dtype=torch.float32, device=device)
+
     src_idx = _as_tensor(src_embedding_dict["indices"], dtype=torch.int64, device=device)
     tgt_idx = _as_tensor(tgt_embedding_dict["indices"], dtype=torch.int64, device=device)
+
+    src_pts = src_pts[src_idx]
+    tgt_pts = tgt_pts[tgt_idx]
 
     src_clustering_soft = _as_tensor(src_clustering_dict["soft_cluster_probs"], dtype=torch.float32, device=device)
     tgt_clustering_soft = _as_tensor(tgt_clustering_dict["soft_cluster_probs"], dtype=torch.float32, device=device)
@@ -458,8 +468,8 @@ def _build_diff_operators(l_x: int, l_y: int) -> dict:
         ops["l1x"] = torch.kron(_diff1(l_x), I_y)
         ops["l1y"] = torch.kron(I_x, _diff1(l_y))
     else:
-        ops["L1x"] = torch.zeros(0, P, dtype=torch.float32, device=device)
-        ops["L1y"] = torch.zeros(0, P, dtype=torch.float32, device=device)
+        ops["l1x"] = torch.zeros(0, P, dtype=torch.float32, device=device)
+        ops["l1y"] = torch.zeros(0, P, dtype=torch.float32, device=device)
 
     if l_x > 2 and l_y > 2:
         ops["l2x"] = torch.kron(_diff2(l_x), I_y)
@@ -794,7 +804,7 @@ class _ProbabilisticRegistration:
                     tear_gate_history.append(float(tear_cat.mean()) if tear_cat.numel() > 0 else 1.0)
                 if self.allow_folds:
                     fold_cat = torch.cat([w["w2x"], w["w2y"]])
-                    tear_gate_history.append(float(fold_cat.mean()) if fold_cat.numel() > 0 else 1.0)
+                    fold_gate_history.append(float(fold_cat.mean()) if fold_cat.numel() > 0 else 1.0)
 
             # [3] Field posterior (both x- and y-components)
             mu_x, v_x = self._update_field(
@@ -902,23 +912,9 @@ class _ProbabilisticRegistration:
                 src_x=delta_src,
                 tgt_x=tgt_x,
                 tgt_scores=tgt_scores,
-                use_softmax=True
+                use_softmax=use_softmax
             )
             diff_history.append(diff_src)
-
-            postfix = {
-                "ELBO":       f"{elbo_val:.4f}",
-                "ΔELBO":      f"{rel_improve:.2e}" if elbo_prev is not None else "NA",
-                "pi0":        f"{pi0:.3f}",
-                "σ_in":       f"{math.sqrt(max(sigma2_in, 0.0)):.3f}",
-                "α":          f"{alpha:.3f}",
-                "stop_count": f"{no_improve_count}/{self.patience}",
-            }
-
-            if self.allow_tears:
-                postfix["tear_w"] = f"{tear_gate_history[-1]:.2f}"
-            if self.allow_folds:
-                postfix["fold_w"] = f"{fold_gate_history[-1]:.2f}"
 
             _update_progress(
                 progress=progress, 
@@ -1158,7 +1154,7 @@ class _ProbabilisticRegistration:
             w["w1y"] = _edge_weight(ops["l1y"], kappa_tear)
         else:
             w["w1x"] = torch.zeros(ops["l1x"].shape[0], dtype=torch.float32, device=device)
-            w["w1y"] = torch.zeros(ops["l1y"].shape[0], dtype=torch.floar32, device=device)
+            w["w1y"] = torch.zeros(ops["l1y"].shape[0], dtype=torch.float32, device=device)
 
         if self.allow_folds:
             w["w2x"] = _edge_weight(ops["l2x"], kappa_fold)

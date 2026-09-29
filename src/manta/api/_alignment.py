@@ -2,15 +2,16 @@ import anndata as ad
 import numpy as np
 import torch
 
-from typing import Any, Dict, List, Literal, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from ..core.alignment._rigid import (
+from ..old.alignment._rigid import (
     _aggregate,
     _match_voxels,
     _apply_transform,
     _ransac
 )
-from ..core.alignment._non_rigid import (
+from ..old.alignment._non_rigid import (
     _match,
     _ProbabilisticRegistration
 )
@@ -195,8 +196,7 @@ def non_rigid(
     num_sinkhorn_iters: int = 50,
 
     # Probabilistic registration parameters
-    l_x: int = 32,
-    l_y: int = 32,
+    scales: list[int] = [4, 8, 16],
     regularisation_shape: Literal["bending", "membrane", "combined"] = "bending",
 
     pi0_init: float = 0.8,
@@ -248,76 +248,260 @@ def non_rigid(
             f"expected clustering to be of type `dict`, got `None`"
         )
 
-    transport_dict = _match(
-        src_embedding_dict=src_embedding_dict,
-        tgt_embedding_dict=tgt_embedding_dict,
+    internal_spatial_key = spatial_key
 
-        src_clustering_dict=src_clustering_dict,
-        tgt_clustering_dict=tgt_clustering_dict,
-        
-        top_n_clusters=top_n_clusters,
-        top_k_matches=top_k_matches,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        temperature=temperature,
-        epsilon=epsilon,
-        rho_src=rho_src,
-        rho_tgt=rho_tgt,
-        num_sinkhorn_iters=num_sinkhorn_iters
+    for scale in scales:
+        transport_dict = _match(
+            source=source,
+            target=target,
+
+            src_embedding_dict=src_embedding_dict,
+            tgt_embedding_dict=tgt_embedding_dict,
+
+            src_clustering_dict=src_clustering_dict,
+            tgt_clustering_dict=tgt_clustering_dict,
+
+            spatial_key=internal_spatial_key,
+            
+            top_n_clusters=top_n_clusters,
+            top_k_matches=top_k_matches,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            temperature=temperature,
+            epsilon=epsilon,
+            rho_src=rho_src,
+            rho_tgt=rho_tgt,
+            num_sinkhorn_iters=num_sinkhorn_iters
+        )
+
+        # Set matching dict for potential plotting
+        source.uns["matching"] = transport_dict
+        target.uns["matching"] = transport_dict
+
+        src_anchors = src_embedding_dict["pts"]
+        tgt_indices = transport_dict["target_idx"]
+        tgt_scores  = transport_dict["scores"]
+        tgt_anchors = _as_tensor(target.obsm[spatial_key], dtype=torch.float32, device=device)[tgt_indices]
+
+        registration = _ProbabilisticRegistration(
+            l_x=scale,
+            l_y=scale,
+            regularisation_shape=regularisation_shape,
+
+            pi0_init=pi0_init,
+            sigma_in_init=sigma_in_init,
+            alpha_init=alpha_init,
+            alpha_max=alpha_max,
+
+            barrier_alpha=barrier_alpha,
+            barrier_lr=barrier_lr,
+            barrier_steps=barrier_steps,
+
+            tolerance=tolerance,
+            patience=patience,
+            min_iters=min_iters,
+            n_iters=n_iters,
+
+            discontinuity_aware=discontinuity_aware,
+            allow_tears=allow_tears,
+            allow_folds=allow_folds,
+            kappa_tear=kappa_tear,
+            kappa_fold=kappa_fold,
+            fold_barrier_suppression=fold_barrier_suppression
+        )
+
+        result = registration.fit(
+            src_x=src_anchors,
+            tgt_x=tgt_anchors,
+            tgt_scores=tgt_scores,
+            use_softmax=True
+        )
+
+        src_untransformed = _as_tensor(source.obsm[internal_spatial_key], dtype=torch.float32, device=device)
+        src_transformed = registration.apply_deformation(
+            x=src_untransformed, 
+            result=result
+        )
+
+        internal_spatial_key = f"nonrigid_{scale}"
+
+        source.obsm[internal_spatial_key] = _from_tensor(src_transformed)
+        target.obsm[internal_spatial_key] = target.obsm[spatial_key]    # This doesn't need the internal key
+
+        source.uns[internal_spatial_key] = result
+        target.uns[internal_spatial_key] = result
+
+
+
+from ..matching._prestack import _prealign_stack
+from ..models._encoder import ExpressionEncoder
+from ..models._field import CanonicalField
+from ..models._ffd import MultiscaleFFD
+from ..training._cavi import MantaModelTrainer, SliceData
+
+
+@dataclass
+class MantaResult:
+    registered_x:       List[torch.Tensor]
+    embeddings:         List[torch.Tensor]
+    inlier_rates:       List[torch.Tensor]
+    field:              CanonicalField
+    encoder:            ExpressionEncoder
+    deformation:        MultiscaleFFD
+    origin:             torch.Tensor
+    h:                  float
+    elbo_hist:          List[float]
+
+    def apply_deformation(
+        self,
+        x: torch.Tensor,
+        slice_id: int
+    ) -> torch.Tensor:
+        return self.deformation.apply_full(
+            x=x,
+            slice_id=slice_id,
+            origin=self.origin,
+            h=self.h
+        )
+
+    @torch.no_grad()
+    def query_field(
+        self,
+        x_canonical: torch.Tensor
+    ) -> torch.Tensor:
+        return self.field(x_canonical)
+
+
+class MantaRegistration:
+    def __init__(
+        self,
+        n_scales: int = 3,
+        l_init: int = 8,
+        l_final: int = 32,
+        latent_dim: int = 64,
+        inter_slice_distance: Optional[float] = None,
+        **trainer_kwargs
+    ):
+        self.device = _get_device()
+
+        self.n_scales = n_scales
+        self.l_init = l_init
+        self.l_final = l_final
+        self.latent_dim = latent_dim
+        self.inter_slice_distance = inter_slice_distance
+        self.trainer_kwargs = trainer_kwargs
+
+    def _make_grid_shapes(self, D: int) -> List[Tuple[int,...]]:
+        shapes = []
+        for i in range(self.n_scales):
+            t = i / max(self.n_scales - 1, 1)
+            L = int(round(self.l_init + t * (self.l_final - self.l_init)))
+            shapes.append(tuple([L] * D))
+        return shapes
+
+    def _make_slice_data(
+        self, 
+        slices: List[ad.AnnData],
+        spatial_key: str,
+        expression_key: str | None = None,
+    ) -> List[SliceData]:
+        if spatial_key is None:
+            raise ValueError(f"spatial_key must be provided to align slices")
+        return [
+            SliceData(
+                x=_as_tensor(slice.obsm[spatial_key], dtype=torch.float32, device=self.device),
+                expr=_as_tensor(slice.X, dtype=torch.float32, device=self.device) \
+                    if expression_key is None else _as_tensor(slice.obsm[expression_key], dtype=torch.float32, device=self.device) 
+            )
+            for slice in slices
+        ]
+
+    def fit(
+        self,
+        slices: List[ad.AnnData],
+        spatial_key: str,
+        expression_key: str | None = None,
+        verbose: bool = True
+    ) -> MantaResult:
+        slices = self._make_slice_data(
+            slices=slices,
+            spatial_key=spatial_key,
+            expression_key=expression_key
+        )
+
+        D_in = slices[0].x.shape[1]
+        if D_in == 2:
+            spacing = self.inter_slice_distance
+
+            if spacing is None:
+                # Heuristic - mean NN spacing along x
+                x = slices[0].x
+                dd = torch.cdist(x[:1000], x[:1000])
+                dd.fill_diagonal_(float("inf"))
+                spacing = float(dd.min(dim=1).values.median().item())
+
+                if verbose:
+                    print(f"Using inter-slice spacing: {spacing}")
+            paired = [(s.x, s.expr) for s in slices]
+            stacked = _prealign_stack(paired, inter_slice_distance=spacing)
+            slices = [SliceData(x=stacked[k], expr=slices[k].expr) for k in range(len(slices))]
+
+            D = 3
+        else:
+            D = D_in
+
+        G = slices[0].expr.shape[1]
+        grid_shapes = self._make_grid_shapes(D=D)
+
+        trainer = MantaModelTrainer(
+            D=D,
+            G=G,
+            n_slices=len(slices),
+            grid_shapes=grid_shapes,
+            latent_dim=self.latent_dim,
+            **self.trainer_kwargs
+        )
+        out = trainer.fit(slices=slices, verbose=True)
+
+        return MantaResult(
+            registered_x=out["canonical"],
+            embeddings=out["embeddings"],
+            inlier_rates=out["inlier_rates"],
+            field=out["field"],
+            encoder=out["encoder"],
+            deformation=out["deformation"],
+            origin=out["origin"],
+            h=out["h"],
+            elbo_hist=out["elbo_hist"]
+        )
+
+
+def register(
+    slices: List[ad.AnnData],
+    spatial_key: str,
+    expression_key: str | None = None,
+
+    n_scales: int = 3,
+    l_init: int = 8,
+    l_final: int = 32,
+    latent_dim: int = 64,
+    inter_slice_distance: Optional[float] = None,
+    verbose: bool = True,
+
+    **trainer_kwargs
+) -> MantaResult:
+    registration = MantaRegistration(
+        n_scales=n_scales,
+        l_init=l_init,
+        l_final=l_final,
+        latent_dim=latent_dim,
+        inter_slice_distance=inter_slice_distance,
+        trainer_kwargs=trainer_kwargs
     )
-
-    # Set matching dict for potential plotting
-    source.uns["matching"] = transport_dict
-    target.uns["matching"] = transport_dict
-
-    src_anchors = src_embedding_dict["pts"]
-    tgt_indices = transport_dict["target_idx"]
-    tgt_scores  = transport_dict["scores"]
-    tgt_anchors = _as_tensor(target.obsm[spatial_key], dtype=torch.float32, device=device)[tgt_indices]
-
-    registration = _ProbabilisticRegistration(
-        l_x=l_x,
-        l_y=l_y,
-        regularisation_shape=regularisation_shape,
-
-        pi0_init=pi0_init,
-        sigma_in_init=sigma_in_init,
-        alpha_init=alpha_init,
-        alpha_max=alpha_max,
-
-        barrier_alpha=barrier_alpha,
-        barrier_lr=barrier_lr,
-        barrier_steps=barrier_steps,
-
-        tolerance=tolerance,
-        patience=patience,
-        min_iters=min_iters,
-        n_iters=n_iters,
-
-        discontinuity_aware=discontinuity_aware,
-        allow_tears=allow_tears,
-        allow_folds=allow_folds,
-        kappa_tear=kappa_tear,
-        kappa_fold=kappa_fold,
-        fold_barrier_suppression=fold_barrier_suppression
+    return registration.fit(
+        slices=slices,
+        spatial_key=spatial_key,
+        expression_key=expression_key,
+        verbose=verbose
     )
-
-    result = registration.fit(
-        src_x=src_anchors,
-        tgt_x=tgt_anchors,
-        tgt_scores=tgt_scores,
-        use_softmax=True
-    )
-
-    src_untransformed = _as_tensor(source.obsm[spatial_key], dtype=torch.float32, device=device)
-    src_transformed = registration.apply_deformation(
-        x=src_untransformed, 
-        result=result
-    )
-
-    source.obsm["nonrigid"] = _from_tensor(src_transformed)
-    target.obsm["nonrigid"] = target.obsm[spatial_key]
-
-    source.uns["nonrigid"] = result
-    target.uns["nonrigid"] = result

@@ -4,8 +4,8 @@ import torch
 from torch_geometric.nn import radius
 from typing import List, Literal, Optional
 
-from ..core.encoders._graphsage_encoder import _embed
-from ..core._features import (
+from ..old.encoders._graphsage_encoder import _embed
+from ..old._features import (
     _compute_graph,
     _compute_base_features,
     _compute_gene_features,

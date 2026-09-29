@@ -4,7 +4,7 @@ import torch
 
 from typing import Any, Dict, List, Optional
 
-from ..core.alignment._rigid_cuda import (
+from ..old.alignment._rigid_cuda import (
     _aggregate,
     _match_voxels,
     _apply_transform,

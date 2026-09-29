@@ -1,7 +1,7 @@
 import anndata as ad
 import torch
 
-from ..core._operators import _density_nd
+from ..old._operators import _density_nd
 from ..utils._tensor_utils import (
     TensorLike,
     _get_device,
