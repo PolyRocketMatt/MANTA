@@ -1,6 +1,8 @@
 import math
 import time
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from dataclasses import dataclass
 from typing import Literal, List, Optional, Sequence, Tuple
@@ -9,8 +11,10 @@ from ..matching._ot import _compute_displacement_targets, _sparse_unbalanced_sin
 from ..models._ffd import MultiscaleFFD
 from ..models._encoder import ExpressionEncoder
 from ..models._field import CanonicalField
+from ..models._gat import HeterogeneousGAT
 from ..primitives._bspline import _eval_stencil
 from ..primitives._diff_ops import _build_gmrf
+from ..primitives._weighted_gmrf import _build_weighted_gmrf
 from ..svi._elbo import _compute_elbo
 from ..svi._cavi_updates import (
     _jacobian_barrier_step,
@@ -52,6 +56,12 @@ class MantaModelTrainer:
         sigma2_in_init: Optional[float] = None,
         alpha_init: float = 1.0,
         alpha_max: float = 1e6,
+        discontinuity_aware: bool = True,
+        kappa_tear: Optional[float] = None,
+        kappa_fold: Optional[float] = None,
+        allow_tears: bool = True,
+        allow_folds: bool = True,
+        sparse_threshold: int = 8192,
 
         # Barrier
         barrier_alpha: float = 1.0,
@@ -68,8 +78,6 @@ class MantaModelTrainer:
         ot_n_candidates: int = 32,
         ot_n_iters: int = 50,
         ot_epsilon: float = 0.05,
-        ot_rho_src: float = 1.0,
-        ot_rho_tgt: float = 1.0,
         ot_alpha: float = 1.0,
         ot_beta: float = 1.0,
 
@@ -99,6 +107,12 @@ class MantaModelTrainer:
         self.sigma2_in_init = sigma2_in_init
         self.alpha_init = alpha_init
         self.alpha_max = alpha_max
+        self.discontinuity_aware = discontinuity_aware
+        self.kappa_tear = kappa_tear
+        self.kappa_fold = kappa_fold
+        self.allow_tears = allow_tears
+        self.allow_folds = allow_folds
+        self.sparse_threshold = sparse_threshold
 
         self.barrier_alpha = barrier_alpha
         self.barrier_lr = barrier_lr
@@ -112,8 +126,6 @@ class MantaModelTrainer:
         self.ot_n_candidates = ot_n_candidates
         self.ot_n_iters = ot_n_iters
         self.ot_epsilon = ot_epsilon
-        self.ot_rho_src = ot_rho_src
-        self.ot_rho_tgt = ot_rho_tgt
         self.ot_alpha = ot_alpha
         self.ot_beta = ot_beta
 
@@ -126,13 +138,29 @@ class MantaModelTrainer:
         self.freeze_threshold = freeze_threshold
         self.reg_shape = reg_shape
 
+        # Infer rho_src/tgt
+        self.log_rho_src = nn.Parameter(torch.zeros(n_slices, device=self.device))
+        self.log_rho_tgt = nn.Parameter(torch.zeros(n_slices, device=self.device))
+        self.rho_lr = 0.05
+        self.rho_target_inlier = 0.85
+
         # Modules
         self.field = CanonicalField(D=D, d=latent_dim).to(self.device)
         self.encoder = ExpressionEncoder(G=G, out=latent_dim).to(self.device)
         self.deformation = MultiscaleFFD(D=D, n_slices=n_slices, grid_shapes=self.grid_shapes).to(self.device)
+        self.gat = HeterogeneousGAT(
+            in_dim=latent_dim,
+            hidden=latent_dim,
+            out_dim=latent_dim,
+            n_spot_layers=2,
+            heads=4,
+            k=8
+        )
 
         self.opt_nn = torch.optim.Adam(
-            list(self.field.parameters()) + list(self.encoder.parameters()),
+            list(self.field.parameters()) 
+            + list(self.encoder.parameters())
+            + list(self.gat.parameters()),
             lr=lr_nn
         )
 
@@ -158,13 +186,37 @@ class MantaModelTrainer:
             )
         return x
 
+    def _gat_embeddings(
+        self,
+        slices: List[SliceData],
+        origin: torch.Tensor,
+        h: float,
+        scale: int
+    ) -> List[torch.Tensor]:
+        with torch.no_grad():
+            enc_feats = [self.encoder(s.expr) for s in slices]
+        canon = [
+            self.deformation.apply_full(
+                x=s.x,
+                slice_id=k,
+                origin=origin,
+                h=h
+            )
+            for k, s in enumerate(slices)
+        ]
+        slice_ids = list(range(len(slices)))
+        return self.gat(enc_feats, canon, slice_ids, scale)
+
     @torch.no_grad()
     def _compute_targets(
         self,
         slices: Sequence[SliceData],
         inputs: Sequence[torch.Tensor],
         origin: torch.Tensor,
-        h: float
+        h: float,
+        scale: int,
+        rho_src: torch.Tensor,
+        rho_tgt: torch.Tensor,
     ) -> List[torch.Tensor]:
         """
         For each slice k, match its input to the pooled inputs of 
@@ -173,7 +225,12 @@ class MantaModelTrainer:
         of slice k.
         """
         K = len(slices)
-        z_list = [self.encoder(s.expr) for s in slices]
+        z_list = self._gat_embeddings(
+            slices=slices,
+            origin=origin,
+            h=h,
+            scale=scale
+        )
 
         targets = []
         for k in range(K):
@@ -190,8 +247,8 @@ class MantaModelTrainer:
                 beta=self.ot_beta,
                 n_candidates=self.ot_n_candidates,
                 epsilon=self.ot_epsilon,
-                src_rho=self.ot_rho_src,
-                tgt_rho=self.ot_rho_tgt,
+                src_rho=float(rho_src[k]),
+                tgt_rho=float(rho_tgt[k]),
                 n_iters=self.ot_n_iters
             )
 
@@ -205,7 +262,7 @@ class MantaModelTrainer:
             )
 
             targets.append(delta)
-        return delta
+        return targets
 
     def _cavi_slice(
         self,
@@ -240,12 +297,20 @@ class MantaModelTrainer:
             spread = (delta.max(0).values - delta.min(0).values).clamp_min(1e-6)
             sigma2_in = float((spread ** 2).mean().item() / 8.0)
 
+        if self.kappa_tear is None:
+            self.kappa_tear = 0.1 * delta.var(dim=0).sum()
+        if self.kappa_fold is None:
+            self.kappa_fold = 0.1 * delta.var(dim=0).sum()
+
         omega = (delta.max(0).values - delta.min(0).values).clamp_min(1e-6)
         log_ell_out = float(-torch.log(omega).sum().item())
 
         # Frozen mask -> 0 weight
         active = (~frozen).float()
         active_sum = active.sum().clamp_min(1.0)
+
+        # Solver mode
+        mode = "sparse" if P > self.sparse_threshold else "dense"
 
         elbo_hist = []
         for it in range(self.n_iters):
@@ -275,7 +340,9 @@ class MantaModelTrainer:
                 L0_diag=L0_diag,
                 alpha=alpha,
                 sigma2_in=sigma2_in,
-                P=P
+                P=P,
+                mode=mode,
+                sparse_threshold=self.sparse_threshold
             )
 
             # Update hyperparams
@@ -298,6 +365,25 @@ class MantaModelTrainer:
                     alpha_max=self.alpha_max
                 )
             )
+
+            if self.discontinuity_aware:
+                w_dict = _update_edge_weights(
+                    mu=mu,
+                    v=v,
+                    grid_shape=self.grid_shapes[scale],
+                    kappa_tear=self.kappa_tear,
+                    kappa_fold=self.kappa_fold,
+                    allow_tears=self.allow_tears,
+                    allow_folds=self.allow_folds
+                )
+                L0 = _build_weighted_gmrf(
+                    D=D,
+                    grid_shape=self.grid_shapes[scale],
+                    w_dict=w_dict,
+                    reg_shape=self.reg_shape,
+                    device=mu.device
+                )
+                L0_diag = L0.diagonal().clone()
 
             # Jacobian barrier
             if self.barrier_alpha > 0.0:
@@ -343,12 +429,13 @@ class MantaModelTrainer:
         self,
         slices: List[SliceData],
         origin: torch.Tensor,
-        h: float
+        h: float,
+        scale: int
     ) -> None: 
         K = len(slices)
 
         for _ in range(self.jepa_steps):
-            c_list = [
+            canon = [
                 self.deformation.apply_full(
                     x=s.coords, 
                     slice_id=k, 
@@ -358,23 +445,28 @@ class MantaModelTrainer:
                 for k, s in enumerate(slices)
             ]
 
+            enc_feats = [self.encoder(s.expr) for s in slices]
+            slice_ids = list(range(K))
+            z_gat = self.gat(enc_feats, canon, slice_ids, scale)
+
             loss = 0.0
             for k in range(K):
-                with torch.no_grad():
-                    z_k = self.encoder(slices[k].expr)
-                phi_k = self.field(c_list[k])
-                loss = loss + ((phi_k - z_k) ** 2).mean()
+                phi_k = self.field(canon[k])
 
-            # VICReg on encoder output
+                with torch.no_grad():
+                    z_target = enc_feats[k].detach()
+                loss = loss + ((phi_k - z_target) ** 2).mean()
+
+            # VICReg on GAT output
             for k in range(K):
-                z_k = self.encoder(slices[k].expr)
-                z_c = z_k - z_k.mean(dim=0, keepdim=True)
+                z = z_gat[k]
+                z_c = z - z.mean(dim=0, keepdim=True)
                 std = (z_c.pow(2).mean(dim=0) + 1e-4).sqrt()
                 var_term = torch.clamp(1.0 - std, min=0.0).mean()
-                if z_k.shape[0] > 1:
-                    cov = (z_c.T @ z_c) / (z_k.size(0) - 1)
+                if z.shape[0] > 1:
+                    cov = (z_c.T @ z_c) / (z.shape[0] - 1)
                     off = cov - torch.diag(torch.diagonal(cov))
-                    cov_term = off.pow(2).sum() / z_k.shape[1]
+                    cov_term = off.pow(2).sum() / z.shape[1]
                     
                 loss = var_term * self.vicreg_var_reg + cov_term * self.vicreg_cov_reg
 
@@ -451,6 +543,10 @@ class MantaModelTrainer:
             ).to(device)
             L0_diag = L0.diagonal().clone()
 
+            # Compute rho's
+            rho_src = F.softplus(self.log_rho_src).detach() + 1e-3
+            rho_tgt = F.softplus(self.log_rho_tgt).detach() + 1e-3
+
             # Targets
             if verbose:
                 print(f"    Computing displacement targets")
@@ -458,7 +554,10 @@ class MantaModelTrainer:
                 slices=slices,
                 inputs=inputs,
                 origin=origin,
-                h=h
+                h=h,
+                scale=scale,
+                rho_src=rho_src,
+                rho_tgt=rho_tgt
             )
 
             for it in range(self.n_iters):
@@ -512,11 +611,22 @@ class MantaModelTrainer:
                             print(f"    Coverged at iter {it}")
                         break
 
-            # Freeze
+            # Freeze and update rho's
+
             for k in range(K):
                 st = final_states[k]
                 if st is not None:
                     frozen[k] = frozen[k] | (st["r"] > self.freeze_threshold)
+
+                    mean_r = float(st["r"].mean().item())
+                    delta_lr = self.rho_lr * (mean_r - self.rho_target_inlier)
+                    with torch.no_grad():
+                        self.log_rho_src[k] += delta_lr
+                        self.log_rho_tgt[k] += delta_lr
+
+
+            # Flush GAT cache
+            self.gat.flush_cache()
 
         self.per_slice_final = final_states
         return self._build_result(
@@ -555,5 +665,7 @@ class MantaModelTrainer:
             "deformation": self.deformation,
             "origin": origin,
             "h": h,
-            "elbo_hist": self.elbo_history
+            "elbo_hist": self.elbo_history,
+            "rho_src": self.log_rho_src.exp(),
+            "rho_tgt": self.log_rho_tgt.exp()
         }

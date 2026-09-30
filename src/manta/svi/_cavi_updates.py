@@ -1,12 +1,38 @@
 import math
+import numpy as np
 import torch
 
-from typing import Tuple
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from typing import Literal, Tuple
 
 from ..primitives._bspline import _eval_stencil_derivative
 from ..primitives._diff_ops import _apply_diff_axis, _apply_diff_axis_sq_variance
 from ..primitives._robust import _geman_mcclure_weight
 from ..utils._gpu import _chunked_range
+
+
+def _solve_dense(
+    H: torch.Tensor, 
+    rhs: torch.Tensor
+) -> torch.Tensor:
+    return torch.linalg.solve(H, rhs)
+
+
+def _solve_sparse(
+    H_dense: torch.Tensor,
+    rhs_dense: torch.Tensor
+) -> torch.Tensor:
+    device = H_dense.device
+    H_np = H_dense.detach().cpu().numpy()
+    rhs_np = rhs_dense.detach().cpu().numpy()
+
+    # Threshold small entries to sparsify
+    H_np[np.abs(H_np) < 1e-8] = 0.0
+    H_sp = sp.csc_matrix(H_np)
+    lu = spla.splu(H_sp)
+    x_np = lu.solve(rhs_np)
+    return torch.from_numpy(x_np).to(dtype=H_dense.type, device=device)
 
 
 def _update_field(
@@ -20,6 +46,8 @@ def _update_field(
     sigma2_in: float, 
     P: int,
     H: torch.Tensor | None = None,
+    mode: Literal["sparse", "dense", "auto"] = "auto",
+    sparse_threshold: int = 8192,
     batch_size: int = 8192,
     return_H: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -33,6 +61,9 @@ def _update_field(
     device = delta.device
     N, S = stencil_w.shape
     D = delta.shape[1]
+
+    if mode == "auto":
+        mode = "dense" if P <= sparse_threshold else "sparse"
 
     if H is None:
         H = torch.zeros(P, P, dtype=torch.float32, device=device)
@@ -63,7 +94,10 @@ def _update_field(
             rhs[:, d].index_add_(0, idx.reshape(-1), contrib)
     rhs = rhs / sigma2_in
 
-    mu = torch.linalg.solve(H, rhs)
+    if mode == "sparse":
+        mu = _solve_sparse(H, rhs)
+    else:
+        mu = torch.linalg.solve(H, rhs)
 
     # Mean-field varance
     data_prec = torch.zeros(P, device=device)
@@ -192,6 +226,7 @@ def _jacobian_barrier_step(
     alpha: float = 1.0,
     beta: float = 0.0,
     barrier_weight: torch.Tensor | None = None,
+    use_adam: bool = True
 ) -> torch.Tensor:
     device = x.device
     N, D = x.shape
@@ -209,6 +244,11 @@ def _jacobian_barrier_step(
 
     eye = torch.eye(D, device=device).unsqueeze(0)
     mu_det = mu.detach().clone()
+
+    if use_adam:
+        opt = torch.optim.Adam([mu_det], lr=lr)
+    else:
+        opt = None
 
     for _ in range(steps):
         mu_req = mu_det.clone().requires_grad_(True)
@@ -236,10 +276,17 @@ def _jacobian_barrier_step(
 
         if beta > 0.0:
             loss = loss + beta * ((det_J - 1.0) ** 2 * w).mean()
-            
-        grad = torch.autograd.grad(loss, mu_req)[0]
-        with torch.no_grad():
-            mu_det = mu_det - lr * grad
+
+        if use_adam:
+            opt.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                opt.step()
+            mu_det = mu_det.detach().requires_grad_(False)
+        else:
+            grad = torch.autograd.grad(loss, mu_req)[0]
+            with torch.no_grad():
+                mu_det = mu_det - lr * grad
 
     return mu_det
 
