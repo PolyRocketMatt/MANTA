@@ -41,7 +41,7 @@ class SpotAttentionLayer(nn.Module):
         tgt_a = (Wh[tgt] * self.a[:, self.Dh:]).sum(dim=-1)
         
         e = F.leaky_relu(src_a + tgt_a, 0.2)
-        e = e - e.max(dim=0, keepdim=True).values().detach()
+        e = e - e.max(dim=0, keepdim=True).values.detach()
 
         exp_e = self.drop(e.exp())
         denom = torch.zeros(N, self.H, device=h.device).index_add_(0, tgt, exp_e)
@@ -85,8 +85,8 @@ class SliceAttentionLayer(nn.Module):
 
         attention = torch.einsum("khd,jhd->khj", Q, Kk) / (self.Dh ** 0.5)
         eye = torch.eye(K, dtype=torch.bool, device=device)
-        attention = attention.masked_fill(eye.unsqueeze(-1), float("-inf"))
-        alpha = attention.softmax(dim=-2)
+        attention = attention.masked_fill(eye.unsqueeze(1), float("-inf"))
+        alpha = attention.softmax(dim=-1)
         msg = torch.einsum("khj,jhd->khd", alpha, Vv).reshape(K, -1)
         return [self.ln(f + msg[k].unsqueeze(0)) for k, f in enumerate(features)]
 
@@ -122,7 +122,7 @@ class HeterogeneousGAT(nn.Module):
         self.out = nn.Linear(hidden, out_dim)
 
         # Cache: {(slice_id, scale): edge_index [2, E]}
-        self._edge_cache = Dict[Tuple[int, int], torch.Tensor] = {}
+        self._edge_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
     def flush_cache(self):
         self._edge_cache.clear()

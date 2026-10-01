@@ -51,12 +51,12 @@ def _eval_stencil(
     u_floor = u.floor().long()
 
     offsets = torch.arange(-1, 3, device=device)
-    u_diff = u.unsqueeze(3) - offsets.view(1, 1, 4)
+    u_diff = u.unsqueeze(2) - offsets.view(1, 1, 4)
     w = _cubic_bspline(u_diff)
 
     idx_per_dim = u_floor.unsqueeze(2) + offsets.view(1, 1, 4)
     grid_lims = torch.tensor(grid_shape, dtype=torch.long, device=device)
-    idx_per_dim = idx_per_dim.clamp(min=0, max=grid_lims.view(1, D, 1) - 1)
+    idx_per_dim = idx_per_dim.clamp(min=torch.zeros_like(idx_per_dim), max=grid_lims.view(1, D, 1) - 1)
 
     strides = torch.ones(D, dtype=torch.long, device=device)
     for d in range(1, D):

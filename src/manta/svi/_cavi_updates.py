@@ -97,7 +97,7 @@ def _update_field(
     if mode == "sparse":
         mu = _solve_sparse(H, rhs)
     else:
-        mu = torch.linalg.solve(H, rhs)
+        mu = _solve_dense(H, rhs)
 
     # Mean-field varance
     data_prec = torch.zeros(P, device=device)
@@ -141,7 +141,7 @@ def _update_responsibilities(
         w = stencil_w[s:e]
 
         pred_chunk = (mu[:, idx].permute(1, 2, 0) * w.unsqueeze(-1)).sum(dim=1)
-        pvar_chunk = (w.pow(2) * v[idx]).sum(dim=1)
+        pvar_chunk = (w.pow(2).unsqueeze(-1) * v[idx]).sum(dim=1)
 
         pred[s:e] = pred_chunk
         pvar[s:e] = pvar_chunk
@@ -226,6 +226,7 @@ def _jacobian_barrier_step(
     alpha: float = 1.0,
     beta: float = 0.0,
     barrier_weight: torch.Tensor | None = None,
+    density_weight: float | None = None,
     use_adam: bool = True
 ) -> torch.Tensor:
     device = x.device
@@ -270,12 +271,19 @@ def _jacobian_barrier_step(
             det_J = torch.linalg.det(J)
 
         det_clamped = det_J.clamp(min=1e-4)
+        log_det = det_clamped.log()
+
 
         w = barrier_weight if barrier_weight is not None else 1.0
+        
+        # One-sided fold penalty
         loss = -(alpha * w * det_clamped.log()).sum()
 
         if beta > 0.0:
-            loss = loss + beta * ((det_J - 1.0) ** 2 * w).mean()
+            if density_weight is not None:
+                loss = loss + beta * (w * density_weight * log_det.pow(2)).mean()
+            else:
+                loss = loss + beta * (w * log_det.pow(2)).mean()
 
         if use_adam:
             opt.zero_grad()

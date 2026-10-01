@@ -1,5 +1,5 @@
 from . import (
-    alignment,
+    align,
     cuda,
     embedding,
     plot,

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from ..primitives._mhe import MultiResolutionHashEncoding
+from ._mhe import MultiResolutionHashEncoding
 
 
 class CanonicalField(nn.Module):

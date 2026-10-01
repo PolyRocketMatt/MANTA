@@ -41,8 +41,8 @@ def _binned_knn(
             d = torch.cdist(sub, sub)
             d.fill_diagonal_(float("inf"))  # Infinite distance to self
 
-            nn_d = d.min(dim=1)
-            nn_d = nn_d[torch.isfinite(nn_d)]
+            nn_d = d.min(dim=1).values
+            nn_d = nn_d[torch.isfinite(nn_d) & (nn_d > 0)]  # TODO Why are there duplicates!?
 
             bin_size = float(nn_d.median().item()) * 2.0 if nn_d.numel() > 0 else 1.0
             bin_size = max(bin_size, 1e-6)
@@ -81,7 +81,7 @@ def _binned_knn(
         off = neighbour_offsets[i]
         nb = b_idx + off.unsqueeze(0)
         valid = ((nb >= 0) & (nb < n_bin)).all(-1)
-        nb_clamped = nb.clamp(min=0, max=n_bin - 1)
+        nb_clamped = nb.clamp(min=torch.tensor(0, device=device, dtype=nb.dtype), max=n_bin - 1)
         nb_idx = (nb_clamped * strides).sum(dim=-1)
 
         start = offsets[nb_idx]

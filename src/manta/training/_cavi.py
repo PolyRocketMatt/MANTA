@@ -9,7 +9,7 @@ from typing import Literal, List, Optional, Sequence, Tuple
 
 from ..matching._ot import _compute_displacement_targets, _sparse_unbalanced_sinkhorn
 from ..models._ffd import MultiscaleFFD
-from ..models._encoder import ExpressionEncoder
+from ..models._encoder import ExpressionEncoder, MantaEncoderLoss, _ssl_train_step
 from ..models._field import CanonicalField
 from ..models._gat import HeterogeneousGAT
 from ..primitives._bspline import _eval_stencil
@@ -24,6 +24,7 @@ from ..svi._cavi_updates import (
     _update_responsibilities,
     _update_sigma_in
 )
+from ..utils._spatial import _binned_knn
 from ..utils._tensor_utils import (
     _get_device,
     _as_tensor,
@@ -63,10 +64,12 @@ class MantaModelTrainer:
         allow_folds: bool = True,
         sparse_threshold: int = 8192,
 
-        # Barrier
+        # Barrier + density
         barrier_alpha: float = 1.0,
         barrier_lr: float = 0.1,
         barrier_steps: int = 3,
+        density_beta: float = 0.1,
+        density_k: int = 8,
 
         # Convergence 
         tolerance: float = 1e-4,
@@ -92,7 +95,17 @@ class MantaModelTrainer:
         freeze_threshold: float = 0.95,
 
         # Regularization
-        reg_shape: Literal["bending", "membrane", "combined"] = "bending"
+        reg_shape: Literal["bending", "membrane", "combined"] = "bending",
+
+        # SSL
+        encoder_lr: float = 1e-3,
+        ssl_epochs: int = 10,
+        ssl_steps_per_epoch: int = 15,
+        ssl_batch_size: int = 2048,
+        n_rounds: int = 3,
+        finetune_lr: float = 1e-4,
+        finetune_weight: float = 0.1,
+        finetune_steps: int = 50
     ) -> None:
         self.device = _get_device()
 
@@ -117,6 +130,8 @@ class MantaModelTrainer:
         self.barrier_alpha = barrier_alpha
         self.barrier_lr = barrier_lr
         self.barrier_steps = barrier_steps
+        self.density_beta = density_beta
+        self.density_k = density_k
 
         self.tolerance = tolerance
         self.patience = patience
@@ -144,10 +159,35 @@ class MantaModelTrainer:
         self.rho_lr = 0.05
         self.rho_target_inlier = 0.85
 
+        # SSL
+        self.encoder_lr = encoder_lr
+        self.ssl_epochs = ssl_epochs
+        self.ssl_steps_per_epoch = ssl_steps_per_epoch
+        self.ssl_batch_size = ssl_batch_size
+        self.n_rounds = n_rounds
+        self.finetune_lr = finetune_lr
+        self.finetune_weight = finetune_weight
+        self.finetune_steps = finetune_steps
+
         # Modules
-        self.field = CanonicalField(D=D, d=latent_dim).to(self.device)
-        self.encoder = ExpressionEncoder(G=G, out=latent_dim).to(self.device)
-        self.deformation = MultiscaleFFD(D=D, n_slices=n_slices, grid_shapes=self.grid_shapes).to(self.device)
+        self.field = CanonicalField(
+            D=D, 
+            d=latent_dim
+        ).to(self.device)
+        self.encoder = ExpressionEncoder(
+            in_dim=G,
+            latent_dim=latent_dim,
+            hidden_dim=latent_dim * 4,
+            n_layers=3,
+            decoder_hidden_dim=latent_dim * 2,
+            p_drop=0.1,
+            eta=0.01
+        ).to(self.device)
+        self.deformation = MultiscaleFFD(
+            D=D, 
+            n_slices=n_slices, 
+            grid_shapes=self.grid_shapes
+        ).to(self.device)
         self.gat = HeterogeneousGAT(
             in_dim=latent_dim,
             hidden=latent_dim,
@@ -155,17 +195,36 @@ class MantaModelTrainer:
             n_spot_layers=2,
             heads=4,
             k=8
+        ).to(self.device)
+
+        self.encoder_loss = MantaEncoderLoss(
+            sim_coeff=25.0,
+            var_coeff=25.0,
+            cov_coeff=1.0,
+            lambda_recon=1.0
         )
 
-        self.opt_nn = torch.optim.Adam(
-            list(self.field.parameters()) 
-            + list(self.encoder.parameters())
-            + list(self.gat.parameters()),
+        # Registration optimizer = field + GAT only
+        self.opt_reg = torch.optim.Adam(
+            list(self.field.parameters()) + list(self.gat.parameters()),
             lr=lr_nn
+        )
+
+        # Encoder optimizer
+        self.opt_encoder = torch.optim.AdamW(
+            self.encoder.parameters(),
+            lr=self.encoder_lr,
+            weight_decay=1e-4
+        )
+        self.scheduler_encoder = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=self.opt_encoder,
+            T_max=self.ssl_epochs,
+            eta_min=0.0
         )
 
         # Diagnostics
         self.elbo_history: List[float] = []
+        self.ssl_history: List[float] = []
         self.per_slice_final: List[dict] = []
 
     def _apply_upto(
@@ -194,7 +253,7 @@ class MantaModelTrainer:
         scale: int
     ) -> List[torch.Tensor]:
         with torch.no_grad():
-            enc_feats = [self.encoder(s.expr) for s in slices]
+            enc_feats = [self.encoder.infer(s.expr) for s in slices]
         canon = [
             self.deformation.apply_full(
                 x=s.x,
@@ -220,9 +279,7 @@ class MantaModelTrainer:
     ) -> List[torch.Tensor]:
         """
         For each slice k, match its input to the pooled inputs of 
-        all OTHER slices using sparse unbalanced OT. Return barycentric-
-        projected displacements delta_k in the original input frame
-        of slice k.
+        all OTHER slices. Return barycentric-projected displacements.
         """
         K = len(slices)
         z_list = self._gat_embeddings(
@@ -264,6 +321,49 @@ class MantaModelTrainer:
             targets.append(delta)
         return targets
 
+    def _ssl_pretrain_encoder(
+        self,
+        slices: List[SliceData],
+        verbose: bool = False
+    ) -> List[float]:
+        """
+        Train the encoder on the union of all expression matrices.
+        """
+        x_all = torch.cat([s.expr for s in slices], dim=0)
+        N = x_all.shape[0]
+        history = []
+
+        self.encoder.train()
+        for p in self.encoder.parameters():
+            p.requires_grad_(True)
+
+        for epoch in range(self.ssl_epochs):
+            epoch_loss = 0.0
+
+            for _ in range(self.ssl_steps_per_epoch):
+                batch_idx = torch.randperm(N, device=self.device)[:self.ssl_batch_size]
+                batch_x = x_all[batch_idx]
+
+                losses = _ssl_train_step(
+                    model=self.encoder,
+                    loss_fn=self.encoder_loss,
+                    x=batch_x,
+                    optimizer=self.opt_encoder,
+                    grad_clip=1.0
+                )
+                epoch_loss += losses["loss"]
+            self.scheduler_encoder.step()
+            epoch_loss /= self.ssl_steps_per_epoch
+            history.append(epoch_loss)
+
+            if verbose:
+                print(f"[SSL epoch {epoch}] loss = {epoch_loss:.4f}")
+
+        self.encoder.eval()
+        self.ssl_history.extend(history)
+        return history
+
+
     def _cavi_slice(
         self,
         x: torch.Tensor,
@@ -286,8 +386,8 @@ class MantaModelTrainer:
 
         # Initialize
         mu      = torch.zeros(D, P, device=device)
-        v       = torch.zeros((P,), 0.01, device=device)
-        r       = torch.zeros((N,), self.pi0_init, device=device)
+        v       = torch.full((P,), 0.01, device=device)
+        r       = torch.full((N,), self.pi0_init, device=device)
         pi0     = self.pi0_init
         alpha   = self.alpha_init 
 
@@ -297,10 +397,12 @@ class MantaModelTrainer:
             spread = (delta.max(0).values - delta.min(0).values).clamp_min(1e-6)
             sigma2_in = float((spread ** 2).mean().item() / 8.0)
 
-        if self.kappa_tear is None:
-            self.kappa_tear = 0.1 * delta.var(dim=0).sum()
-        if self.kappa_fold is None:
-            self.kappa_fold = 0.1 * delta.var(dim=0).sum()
+        kappa_tear = self.kappa_tear
+        kappa_fold = self.kappa_fold
+        if kappa_tear is None:
+            kappa_tear = 0.1 * delta.var(dim=0).sum()
+        if kappa_fold is None:
+            kappa_fold = 0.1 * delta.var(dim=0).sum()
 
         omega = (delta.max(0).values - delta.min(0).values).clamp_min(1e-6)
         log_ell_out = float(-torch.log(omega).sum().item())
@@ -311,6 +413,18 @@ class MantaModelTrainer:
 
         # Solver mode
         mode = "sparse" if P > self.sparse_threshold else "dense"
+
+        # Local density estimate
+        rho_local = None
+        if self.density_beta > 0.0:
+            with torch.no_grad():
+                _, d2 = _binned_knn(
+                    x=x,
+                    k=self.density_k
+                )
+                median_d2 = d2.median(dim=1).values.clamp_min(1e-6)
+                rho_local = 1.0 / (median_d2 ** (self.D / 2.0))
+                rho_local = rho_local / rho_local.mean().clamp_min(1e-12)
 
         elbo_hist = []
         for it in range(self.n_iters):
@@ -395,7 +509,10 @@ class MantaModelTrainer:
                     mu=mu,
                     lr=self.barrier_lr,
                     steps=self.barrier_steps,
-                    alpha=self.barrier_alpha
+                    alpha=self.barrier_alpha,
+                    beta=self.density_beta,
+                    density_weight=rho_local,
+                    use_adam=True
                 )
 
             # ELBO
@@ -424,7 +541,7 @@ class MantaModelTrainer:
         
         return mu, v, r, math.sqrt(max(sigma2_in, 1e-8)), alpha, pi0, elbo_hist
 
-
+    # Field + GAT
     def _jepa_step(
         self,
         slices: List[SliceData],
@@ -433,6 +550,9 @@ class MantaModelTrainer:
         scale: int
     ) -> None: 
         K = len(slices)
+        self.encoder.eval()
+        for p in self.encoder.parameters():
+            p.requires_grad_(False)
 
         for _ in range(self.jepa_steps):
             canon = [
@@ -445,34 +565,100 @@ class MantaModelTrainer:
                 for k, s in enumerate(slices)
             ]
 
-            enc_feats = [self.encoder(s.expr) for s in slices]
-            slice_ids = list(range(K))
-            z_gat = self.gat(enc_feats, canon, slice_ids, scale)
+            # Use frozen target from encoder
+            # NO GAT here!
+            with torch.no_grad():
+                z_target = [self.encoder.infer(s.expr) for s in slices]
 
-            loss = 0.0
+            self.opt_reg.zero_grad()
+
+            # JEPA => field(canon) ~ z_target
+            loss_field = 0.0
             for k in range(K):
                 phi_k = self.field(canon[k])
-
-                with torch.no_grad():
-                    z_target = enc_feats[k].detach()
-                loss = loss + ((phi_k - z_target) ** 2).mean()
+                loss_field = loss_field + ((phi_k - z_target[k]) ** 2).mean()
 
             # VICReg on GAT output
-            for k in range(K):
-                z = z_gat[k]
+            with torch.no_grad():
+                enc_feats = [self.encoder.infer(s.expr) for s in slices]
+            z_gat = self.gat(enc_feats, canon, list(range(K)), scale)
+
+            loss_vicreg = 0.0
+            for z in z_gat:
                 z_c = z - z.mean(dim=0, keepdim=True)
                 std = (z_c.pow(2).mean(dim=0) + 1e-4).sqrt()
                 var_term = torch.clamp(1.0 - std, min=0.0).mean()
+                loss_vicreg = loss_vicreg + self.vicreg_var_reg * var_term
                 if z.shape[0] > 1:
                     cov = (z_c.T @ z_c) / (z.shape[0] - 1)
                     off = cov - torch.diag(torch.diagonal(cov))
                     cov_term = off.pow(2).sum() / z.shape[1]
-                    
-                loss = var_term * self.vicreg_var_reg + cov_term * self.vicreg_cov_reg
+                    loss_vicreg = loss_vicreg + self.vicreg_cov_reg * cov_term
 
-            self.opt_nn.zero_grad()
-            (self.jepa_weight * loss).backward()
-            self.opt_nn.step()
+            total_loss = (
+                self.jepa_weight *  loss_field 
+                + self.vicreg_weight * loss_vicreg
+            )
+
+            total_loss.backward()
+            self.opt_reg.step()
+
+        # Canonical coordinates have changed => GAT cache is stale
+        self.gat.flush_cache()
+
+        # Re-enable encoder gradients
+        for p in self.encoder.parameters():
+            p.requires_grad_(True)
+
+    def _finetune_encoder(
+        self,
+        slices: List[SliceData],
+        origin: torch.Tensor,
+        h: float
+    ) -> None:
+        self.encoder.train()
+        for p in self.encoder.parameters():
+            p.requires_grad_(True)
+
+        opt = torch.optim.Adam(self.encoder.parameters(), lr=self.finetune_lr)
+
+        with torch.no_grad():
+            canon = [
+                self.deformation.apply_scale(
+                    x=s.x,
+                    slice_id=k,
+                    origin=origin,
+                    h=h
+                )
+                for k, s in enumerate(slices)
+            ]
+            phi = [self.field(c) for c in canon]
+
+        x_all = torch.cat([s.expr for s in slices], dim=0)
+        phi_all = torch.cat(phi, dim=0)
+
+        for _ in range(self.finetune_steps):
+            batch_idx = torch.randperm(x_all.shape[0], device=self.device)[:self.ssl_batch_size]
+            batch_x     = x_all[batch_idx]
+            batch_phi   = phi_all[batch_idx]
+
+            opt.zero_grad()
+            z = self.encoder.infer(batch_x)
+            loss_align = ((z - batch_phi) ** 2).mean()      # SAME AS JEPA LOSS
+
+            out = self.encoder(batch_x)
+            loss_ssl = self.encoder_loss(
+                z1=out["z1"],
+                z2=out["z2"],
+                x_true=batch_x,
+                x_recon=out["x_recon"]
+            )["loss"]
+
+            total_loss = self.finetune_weights * loss_align + loss_ssl
+            total_loss.backward()
+            opt.step()
+
+        self.encoder.eval()
 
     def fit(
         self,
@@ -501,132 +687,151 @@ class MantaModelTrainer:
 
         origin = origin.to(device)
 
-        frozen = [
-            torch.zeros(s.x.shape[0], dtype=torch.bool, device=device)
-            for s in slices
-        ]
-        final_states = [None] * K
-        for scale in range(self.S):
+        for round_idx in range(self.n_rounds):
             if verbose:
-                print(f"[Scale {scale}] grid={self.grid_shapes[scale]}")
+                print(f"\n=== Round {round_idx + 1}/{self.n_rounds} ===")
 
-            # Inputs at this scale
-            if scale == 0:
-                inputs = [s.x for s in slices]
-            else:
-                inputs = [
-                    self._apply_upto(
-                        x=s.x,
-                        slice_id=k,
-                        up_to_scale=scale - 1,
-                        origin=origin,
-                        h=h
-                    )
-                    for k, s in enumerate(slices)
-                ]
+            # Step 1 - SSL pretraining/refresh
+            self._ssl_pretrain_encoder(slices=slices, verbose=verbose)
 
-            # Stencils
-            stencils = [
-                _eval_stencil(
-                    x=input,
-                    origin=origin,
-                    h=h,
-                    grid_shape=self.grid_shapes[scale]
-                )
-                for input in inputs
+            # Step 2 - Rest frozen mask each round
+            frozen = [
+                torch.zeros(s.x.shape[0], dtype=torch.bool, device=device)
+                for s in slices
             ]
+            final_states = [None] * K
 
-            # Prior(s)
-            L0 = _build_gmrf(
-                grid_shape=self.grid_shapes[scale],
-                shape=self.reg_shape
-            ).to(device)
-            L0_diag = L0.diagonal().clone()
+            # Step 3 - Multi-scale registration
+            for scale in range(self.S):
+                if verbose:
+                    print(f"[Scale {scale}] grid={self.grid_shapes[scale]}")
 
-            # Compute rho's
-            rho_src = F.softplus(self.log_rho_src).detach() + 1e-3
-            rho_tgt = F.softplus(self.log_rho_tgt).detach() + 1e-3
+                # Inputs at this scale
+                if scale == 0:
+                    inputs = [s.x for s in slices]
+                else:
+                    inputs = [
+                        self._apply_upto(
+                            x=s.x,
+                            slice_id=k,
+                            up_to_scale=scale - 1,
+                            origin=origin,
+                            h=h
+                        )
+                        for k, s in enumerate(slices)
+                    ]
 
-            # Targets
-            if verbose:
-                print(f"    Computing displacement targets")
-            targets = self._compute_targets(
-                slices=slices,
-                inputs=inputs,
-                origin=origin,
-                h=h,
-                scale=scale,
-                rho_src=rho_src,
-                rho_tgt=rho_tgt
-            )
-
-            for it in range(self.n_iters):
-                slice_elbos = []
-                for k in range(K):
-                    mu_k, v_k, r_k, sigma_k, alpha_k, pi0_k, elbo_hist = self._cavi_slice(
-                        x=inputs[k],
-                        delta=targets[k],
-                        stencil_idx=stencils[k][0],
-                        stencil_w=stencils[k][1],
-                        L0=L0,
-                        L0_diag=L0_diag,
-                        frozen=frozen[k],
+                # Stencils
+                stencils = [
+                    _eval_stencil(
+                        x=input,
                         origin=origin,
                         h=h,
-                        scale=scale
+                        grid_shape=self.grid_shapes[scale]
                     )
+                    for input in inputs
+                ]
 
-                    with torch.no_grad():
-                        self.deformation.mu[scale][k].data = mu_k
-                        self.deformation.log_var[scale][k].data = torch.log(
-                            v_k.unsqueeze(0).expand(D, -1).clamp_min(1e-12)
-                        )
+                # Prior(s)
+                L0 = _build_gmrf(
+                    grid_shape=self.grid_shapes[scale],
+                    shape=self.reg_shape
+                ).to(device)
+                L0_diag = L0.diagonal().clone()
 
-                    final_states[k] = dict(
-                        r=r_k,
-                        sigma=sigma_k,
-                        alpha=alpha_k,
-                        pi0=pi0_k
-                    )
-                    slice_elbos.append(elbo_hist[-1] if elbo_hist else 0.0)
+                # Compute rho's
+                rho_src = F.softplus(self.log_rho_src).detach() + 1e-3
+                rho_tgt = F.softplus(self.log_rho_tgt).detach() + 1e-3
 
-                if self.jepa_weight > 0.0:
-                    self._jepa_step(
-                        slices=slices,
-                        origin=origin,
-                        h=h
-                    )
-
-                mean_elbo = sum(slice_elbos) / max(K, 1)
-                self.elbo_history.append(mean_elbo)
+                # Targets
+                if verbose:
+                    print(f"    Computing displacement targets")
+                targets = self._compute_targets(
+                    slices=slices,
+                    inputs=inputs,
+                    origin=origin,
+                    h=h,
+                    scale=scale,
+                    rho_src=rho_src,
+                    rho_tgt=rho_tgt
+                )
 
                 if verbose:
-                    print(f"    iter {it}: mean ELBO = {mean_elbo:.4f}")
+                    print(f"    Running JEPA <> CAVI iterations")
+                for it in range(self.n_iters):
+                    slice_elbos = []
+                    for k in range(K):
+                        mu_k, v_k, r_k, sigma_k, alpha_k, pi0_k, elbo_hist = self._cavi_slice(
+                            x=inputs[k],
+                            delta=targets[k],
+                            stencil_idx=stencils[k][0],
+                            stencil_w=stencils[k][1],
+                            L0=L0,
+                            L0_diag=L0_diag,
+                            frozen=frozen[k],
+                            origin=origin,
+                            h=h,
+                            scale=scale
+                        )
+
+                        with torch.no_grad():
+                            self.deformation.mu[scale][k].data = mu_k
+                            self.deformation.log_var[scale][k].data = torch.log(
+                                v_k.unsqueeze(0).expand(D, -1).clamp_min(1e-12)
+                            )
+
+                        final_states[k] = dict(
+                            r=r_k,
+                            sigma=sigma_k,
+                            alpha=alpha_k,
+                            pi0=pi0_k
+                        )
+                        slice_elbos.append(elbo_hist[-1] if elbo_hist else 0.0)
+
+                    if self.jepa_weight > 0.0:
+                        self._jepa_step(
+                            slices=slices,
+                            origin=origin,
+                            h=h,
+                            scale=scale
+                        )
+
+                    mean_elbo = sum(slice_elbos) / max(K, 1)
+                    self.elbo_history.append(mean_elbo)
+
+                    if verbose:
+                        print(f"    iter {it}: mean ELBO = {mean_elbo:.4f}")
 
 
-                if it >= self.min_iters and len(self.elbo_history) >= 2:
-                    rel = abs(self.elbo_history[-1] - self.elbo_history[-2]) / (abs(self.elbo_history[-1]) + 1e-8)
-                    if rel < self.tolerance:
-                        if verbose:
-                            print(f"    Coverged at iter {it}")
-                        break
+                    if it >= self.min_iters and len(self.elbo_history) >= 2:
+                        rel = abs(self.elbo_history[-1] - self.elbo_history[-2]) / (abs(self.elbo_history[-1]) + 1e-8)
+                        if rel < self.tolerance:
+                            if verbose:
+                                print(f"    Coverged at iter {it}")
+                            break
 
-            # Freeze and update rho's
+                # Freeze and update rho's
+                for k in range(K):
+                    st = final_states[k]
+                    if st is not None:
+                        frozen[k] = frozen[k] | (st["r"] > self.freeze_threshold)
 
-            for k in range(K):
-                st = final_states[k]
-                if st is not None:
-                    frozen[k] = frozen[k] | (st["r"] > self.freeze_threshold)
+                        mean_r = float(st["r"].mean().item())
+                        delta_lr = self.rho_lr * (mean_r - self.rho_target_inlier)
+                        
+                        with torch.no_grad():
+                            self.log_rho_src[k] += delta_lr
+                            self.log_rho_tgt[k] += delta_lr
 
-                    mean_r = float(st["r"].mean().item())
-                    delta_lr = self.rho_lr * (mean_r - self.rho_target_inlier)
-                    with torch.no_grad():
-                        self.log_rho_src[k] += delta_lr
-                        self.log_rho_tgt[k] += delta_lr
+                # Flush GAT cache
+                self.gat.flush_cache()
 
-
-            # Flush GAT cache
-            self.gat.flush_cache()
+            # Step 4 - Finetune encoder
+            self._finetune_encoder(
+                slices=slices,
+                origin=origin,
+                h=h
+            )
 
         self.per_slice_final = final_states
         return self._build_result(
@@ -666,6 +871,7 @@ class MantaModelTrainer:
             "origin": origin,
             "h": h,
             "elbo_hist": self.elbo_history,
-            "rho_src": self.log_rho_src.exp(),
-            "rho_tgt": self.log_rho_tgt.exp()
+            "ssl_hist": self.ssl_history,
+            "rho_src": F.softplus(self.log_rho_src).detach(),
+            "rho_tgt": F.softplus(self.log_rho_tgt).detach(),
         }

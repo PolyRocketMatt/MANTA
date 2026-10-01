@@ -497,7 +497,7 @@ def register(
         l_final=l_final,
         latent_dim=latent_dim,
         inter_slice_distance=inter_slice_distance,
-        trainer_kwargs=trainer_kwargs
+        **trainer_kwargs
     )
     return registration.fit(
         slices=slices,

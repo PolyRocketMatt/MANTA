@@ -9,7 +9,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from pathlib import Path
 from typing import Optional
 
-from ..core.alignment._non_rigid import _NRRegistrationResult
+from ..old.alignment._non_rigid import _NRRegistrationResult
 
 from ..utils._tensor_utils import _from_tensor
 
