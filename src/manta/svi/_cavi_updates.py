@@ -134,14 +134,14 @@ def _update_responsibilities(
     N, D = delta.shape
 
     pred = torch.zeros(N, D, device=device)
-    pvar = torch.zeros(N, D, device=device)
+    pvar = torch.zeros(N, 1, device=device)
 
     for s, e in _chunked_range(N, batch_size):
         idx = stencil_idx[s:e]
         w = stencil_w[s:e]
-
-        pred_chunk = (mu[:, idx].permute(1, 2, 0) * w.unsqueeze(-1)).sum(dim=1)
-        pvar_chunk = (w.pow(2).unsqueeze(-1) * v[idx]).sum(dim=1)
+        mu_chunk = mu[:, idx].permute(1, 2, 0)
+        pred_chunk = (mu_chunk * w.unsqueeze(-1)).sum(dim=1)
+        pvar_chunk = (w.pow(2) * v[idx]).sum(dim=1, keepdim=True)
 
         pred[s:e] = pred_chunk
         pvar[s:e] = pvar_chunk
@@ -156,7 +156,7 @@ def _update_responsibilities(
     log_pi1 = math.log(max(1.0 - pi0, 1e-12))
 
     log_num = log_pi0 + log_ell_in
-    log_denom = torch.logaddexp(log_num, log_ell_in.new_full(), log_pi1 + log_ell_out)
+    log_denom = torch.logaddexp(log_num, torch.full_like(log_num, log_pi1 + log_ell_out))
 
     r = (log_num - log_denom).exp().clamp(1e-6, 1.0 - 1e-6)
     return r
@@ -180,7 +180,7 @@ def _update_sigma_in(
     S = stencil_w.shape[1]
 
     sq_res = torch.zeros(N, D, device=device)
-    pvar = torch.zeros(N, D, device=device)
+    pvar = torch.zeros(N, 1, device=device)
 
     for s, e in _chunked_range(N, batch_size):
         idx = stencil_idx[s:e]
@@ -188,7 +188,7 @@ def _update_sigma_in(
         pred = (mu[:, idx].permute(1, 2, 0) * w.unsqueeze(-1)).sum(dim=1)
 
         sq_res[s:e] = (delta[s:e] - pred).pow(2)
-        pvar[s:e] = (w.pow(2) * v[idx]).sum(dim=1)
+        pvar[s:e] = (w.pow(2) * v[idx]).sum(dim=1, keepdim=True)
 
     num = (r.unsqueeze(1) * (sq_res + pvar)).sum()
     denom = D * r.sum().clamp(min=1e-8)
